@@ -1,0 +1,302 @@
+#!/usr/bin/env python3
+
+import socket
+import sys
+import os
+import selectors
+import struct
+
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+
+server_address = "/nix/var/nix/daemon-socket/socket"
+sock.connect(server_address)
+
+sel = selectors.DefaultSelector()
+
+sel.register(sock, selectors.EVENT_READ)
+sel.register(sys.stdin.buffer, selectors.EVENT_READ)
+
+def eprint(*args, **kwargs):
+    kwargs['file'] = sys.stderr
+    print(*args, **kwargs)
+
+class Message:
+    def __init__(self, data, string_rep=None):
+        self.data = data
+        self.string_rep = string_rep
+
+    def __str__(self):
+        return self.string_rep
+
+WORKER_MAGIC_1 = 0x6e697863
+WORKER_MAGIC_2 = 0x6478696f
+op_to_num = {
+    "STDERR_NEXT": 0x6f6c6d67,
+    "STDERR_READ": 0x64617461,
+    "STDERR_WRITE": 0x64617416,
+    "STDERR_LAST": 0x616c7473,
+    "STDERR_ERROR": 0x63787470,
+    "STDERR_START_ACTIVITY": 0x53545254,
+    "STDERR_STOP_ACTIVITY": 0x53544f50,
+    "STDERR_RESULT": 0x52534c54,
+}
+num_to_op = { num:op for (op, num) in op_to_num.items() }
+wop_to_num = {
+    "wopIsValidPath": 1,
+    "wopHasSubstitutes": 3,
+    "wopQueryPathHash": 4,
+    "wopQueryReferences": 5,
+    "wopQueryReferrers": 6,
+    "wopAddToStore": 7,
+    "wopAddTextToStore": 8,
+    "wopBuildPaths": 9,
+    "wopEnsurePath": 10,
+    "wopAddTempRoot": 11,
+    "wopAddIndirectRoot": 12,
+    "wopSyncWithGC": 13,
+    "wopFindRoots": 14,
+    "wopExportPath": 16,
+    "wopQueryDeriver": 18,
+    "wopSetOptions": 19,
+    "wopCollectGarbage": 20,
+    "wopQuerySubstitutablePathInfo": 21,
+    "wopQueryDerivationOutputs": 22,
+    "wopQueryAllValidPaths": 23,
+    "wopQueryFailedPaths": 24,
+    "wopClearFailedPaths": 25,
+    "wopQueryPathInfo": 26,
+    "wopImportPaths": 27,
+    "wopQueryDerivationOutputNames": 28,
+    "wopQueryPathFromHashPart": 29,
+    "wopQuerySubstitutablePathInfos": 30,
+    "wopQueryValidPaths": 31,
+    "wopQuerySubstitutablePaths": 32,
+    "wopQueryValidDerivers": 33,
+    "wopOptimiseStore": 34,
+    "wopVerifyStore": 35,
+    "wopBuildDerivation": 36,
+    "wopAddSignatures": 37,
+    "wopNarFromPath": 38,
+    "wopAddToStoreNar": 39,
+    "wopQueryMissing": 40,
+}
+num_to_wop = { num:wop for (wop, num) in wop_to_num.items() }
+
+def must_equal(a, b):
+    if a != b:
+        raise Exception("protocol error:", a, "!=", b)
+
+class Client:
+    def __init__(self):
+        self.buf = bytes()
+        self.offset = 0
+        self.state = "start"
+
+    def _unpack(self, fmt):
+        ret = struct.unpack_from(fmt, self.buf, offset=self.offset)
+        self.offset += struct.calcsize(fmt)
+        return ret
+
+    def _unpack_bytes(self, n):
+        ret = self.buf[self.offset:self.offset+n]
+        self.offset += n
+        return ret
+
+    def feed_data_from_server(self, data):
+        self.buf += data
+        if self.state == "start":
+            magic, server_version = self._unpack("LL")
+            must_equal(magic, WORKER_MAGIC_2)
+            self.state = "running"
+            return f"WORKER_MAGIC_2 server_version:{server_version:#0x}"
+        elif self.state in ["wopSetOptions", "wopIsValidPath", "wopEnsurePath", "wopBuildPaths"]:
+            op_num, = self._unpack("L")
+            op = num_to_op[op_num]
+            response, = self._unpack("L")
+            return f"{op} response:{response}"
+        elif self.state == "running":
+            op_num, = self._unpack("L")
+            op = num_to_op[op_num]
+            additional = len(self.buf) - self.offset
+            if additional == 8:
+                response, = self._unpack("L")
+                return f"{op} response:{response}"
+            elif additional == 0:
+                return f"{op}"
+            else:
+                eprint(f"consuming {additional} additional bytes")
+                consumed = self._unpack_bytes(additional)
+                return f"{op} consumed:{consumed}"
+        raise Exception("unknown client state", self.state, "bytes", self.buf[self.offset:])
+
+    def send_wop(self, wop):
+        pass
+
+    def call_wop(self, wop):
+        self.send_wop(wop)
+        assert(self.state == "running")
+        self.state = wop
+
+class WorkerProtocolAPI:
+    def wop_called(self, wop):
+        raise NotImplementedError
+
+class DissectorAdaptor(WorkerProtocolAPI):
+    def __init__(self, client):
+        self.client = client
+
+    def wop_called(self, wop):
+        pass
+        # self.client.call_wop(wop)
+
+class Server:
+    def __init__(self, impl):
+        self.buf = bytes()
+        self.offset = 0
+        self.state = "start"
+        self.impl = impl
+
+    def _unpack(self, fmt):
+        ret = struct.unpack_from(fmt, self.buf, offset=self.offset)
+        self.offset += struct.calcsize(fmt)
+        return ret
+
+    def _unpack_bytes(self, n):
+        ret = self.buf[self.offset:self.offset+n]
+        self.offset += n
+        return ret
+
+    def _unpack_string(self):
+        size, = self._unpack("L")
+        s = self._unpack_bytes(size).decode()
+        padding_size = 8 - (size % 8)
+        padding = self._unpack_bytes(padding_size)
+        return s
+
+    def feed_data(self, data):
+        self.buf += data
+        # remaining = len(self.buf) - self.offset
+        # self.buf = self.buf[self.offset:] + data
+        # self.offset = remaining
+    
+    def feed_data_from_client(self, data):
+        self.feed_data(data)
+        if self.state == "start":
+            magic, = self._unpack("L")
+            must_equal(magic, WORKER_MAGIC_1)
+            self.state = "receive_client_version"
+            return "WORKER_MAGIC_1"
+        elif self.state == "receive_client_version":
+            client_version, = self._unpack("L")
+            ret = f"client_version:{client_version:#0x} "
+            should_set_affinity, = self._unpack("L")
+            if should_set_affinity:
+                cpu_affinity, = self._unpack("L")
+                ret += f"should_set_affinity:{should_set_affinity} cpu_affinity:{cpu_affinity} "
+            else:
+                ret += f"should_set_affinity:{should_set_affinity} "
+            reserve_space, = self._unpack("L")
+            ret += f"reserve_space:{reserve_space}"
+            self.state = "running"
+            return ret
+        elif self.state == "wopSetOptions":
+            keepFailed, keepGoing, tryFallback, verbosity, maxBuildJobs, maxSilentTime, useBuildHook, verboseBuild, logType, printBuildTrace, buildCores, useSubstitutes, numOverrides = self._unpack("L"*13)
+            ret = ("wopSetOptions "
+                   f"keepFailed:{keepFailed} "
+                   f"keepGoing:{keepGoing} "
+                   f"tryFallback:{tryFallback} "
+                   f"verbosity:{verbosity} "
+                   f"maxBuildJobs:{maxBuildJobs} "
+                   f"maxSilentTime:{maxSilentTime} "
+                   f"useBuildHook:{useBuildHook} "
+                   f"verboseBuild:{verboseBuild} "
+                   f"logType:{logType} "
+                   f"printBuildTrace:{printBuildTrace} "
+                   f"buildCores:{buildCores} "
+                   f"useSubstitutes:{useSubstitutes} "
+                   f"numOverrides:{numOverrides}"
+            )
+            if numOverrides != 0:
+                overrides = []
+                for _ in range(numOverrides):
+                    overrides.append((self._unpack_string(), self._unpack_string()))
+                ret += f" {overrides}"
+            self.state = "running"
+            return ret
+        elif self.state == "wopIsValidPath":
+            s = self._unpack_string()
+            self.state = "running"
+            return f"wopIsValidPath {s}"
+        elif self.state == "wopEnsurePath":
+            s = self._unpack_string()
+            self.state = "running"
+            return f"wopEnsurePath {s}"
+        elif self.state == "wopAddToStore":
+            baseName = self._unpack_string()
+            fixed, recursive = self._unpack("LL")
+            hashType = self._unpack_string()
+            self.state = "running"
+            additional = len(self.buf) - self.offset
+            consumed = self._unpack_bytes(len(self.buf) - self.offset)
+            return f"wopAddToStore baseName:{baseName} fixed:{fixed} recursive:{recursive} hashType:{hashType} consumed:{consumed}"
+        elif self.state == "wopBuildPaths":
+            count, = self._unpack("L")
+            paths = []
+            for _ in range(count):
+                paths.append(self._unpack_string())
+            mode, = self._unpack("L")
+            self.state = "running"
+            return f"wopBuildPaths mode:{mode} {paths}"
+        elif self.state == "running":
+            num, = self._unpack("L")
+            additional = len(self.buf) - self.offset
+            if num in num_to_wop:
+                wop = num_to_wop[num]
+                if wop in ["wopSetOptions", "wopIsValidPath", "wopEnsurePath", "wopAddToStore", "wopBuildPaths"]:
+                    self.state = wop
+                    ret = self.feed_data_from_client(bytes())
+                    # lazy hack
+                    self.impl.wop_called(wop)
+                    return ret
+                else:
+                    eprint(f"consuming {additional} additional bytes")
+                    consumed = self._unpack_bytes(additional)
+                    return f"{wop} consumed:{consumed}"
+            elif num in num_to_op:
+                op = num_to_op[num]
+                eprint(f"consuming {additional} additional bytes")
+                consumed = self._unpack_bytes(additional)
+                return f"{op} consumed:{consumed}"
+            else:
+                eprint(f"consuming {additional} additional bytes")
+                consumed = self._unpack_bytes(additional)
+                return f"num:{num} consumed:{consumed}"
+        raise Exception("unknown server state", self.state, "bytes", self.buf[self.offset:])
+
+client = Client()
+server = Server(impl=DissectorAdaptor(client))
+while True:
+    tuples = sel.select()
+    for key, events in tuples:
+        if key.fileobj is sock:
+            data = sock.recv(4096)
+            if len(data) == 0:
+                raise Exception("got EOF on socket")
+            response = client.feed_data_from_server(data)
+            eprint("<", response)
+            sent = os.write(sys.stdout.buffer.fileno(), data)
+            if sent != len(data):
+                raise Exception("partial send from sock to stdout")
+        if key.fileobj is sys.stdin.buffer:
+            data = os.read(sys.stdin.buffer.fileno(), 4096)
+            if len(data) == 0:
+                raise Exception("got EOF on stdin")
+            eprint(">", server.feed_data_from_client(data))
+            while len(server.buf) > server.offset:
+                ret = server.feed_data_from_client(bytes())
+                if ret is None:
+                    break
+                eprint(">", ret)
+            sent = sock.send(data)
+            if sent != len(data):
+                raise Exception("partial send from stdin to sock")
