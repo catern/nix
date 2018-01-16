@@ -102,6 +102,20 @@ class Client:
         self.offset += n
         return ret
 
+    def _unpack_string(self):
+        size, = self._unpack("L")
+        s = self._unpack_bytes(size).decode()
+        padding_size = 8 - (size % 8)
+        padding = self._unpack_bytes(padding_size)
+        return s
+
+    def _unpack_list_of_strings(self):
+        count, = self._unpack("L")
+        ret = []
+        for _ in range(count):
+            ret.append(self._unpack_string())
+        return ret
+
     def feed_data_from_server(self, data):
         self.buf += data
         if self.state == "start":
@@ -109,11 +123,24 @@ class Client:
             must_equal(magic, WORKER_MAGIC_2)
             self.state = "running"
             return f"WORKER_MAGIC_2 server_version:{server_version:#0x}"
-        elif self.state in ["wopSetOptions", "wopIsValidPath", "wopEnsurePath", "wopBuildPaths"]:
+        elif self.state in ["wopSetOptions"]:
+            # no response
+            op_num, = self._unpack("L")
+            op = num_to_op[op_num]
+            self.state = "running"
+            return f"{op}"
+        elif self.state in ["wopIsValidPath", "wopEnsurePath", "wopBuildPaths"]:
+            # single int response
             op_num, = self._unpack("L")
             op = num_to_op[op_num]
             response, = self._unpack("L")
+            self.state = "running"
             return f"{op} response:{response}"
+        elif self.state in ["wopAddToStore"]:
+            op_num, = self._unpack("L")
+            op = num_to_op[op_num]
+            imported_path = self._unpack_string()
+            return f"{op} imported_path:{imported_path}"
         elif self.state == "running":
             op_num, = self._unpack("L")
             op = num_to_op[op_num]
@@ -146,8 +173,7 @@ class DissectorAdaptor(WorkerProtocolAPI):
         self.client = client
 
     def wop_called(self, wop):
-        pass
-        # self.client.call_wop(wop)
+        self.client.call_wop(wop)
 
 class Server:
     def __init__(self, impl):
@@ -172,6 +198,13 @@ class Server:
         padding_size = 8 - (size % 8)
         padding = self._unpack_bytes(padding_size)
         return s
+
+    def _unpack_list_of_strings(self):
+        count, = self._unpack("L")
+        ret = []
+        for _ in range(count):
+            ret.append(self._unpack_string())
+        return ret
 
     def feed_data(self, data):
         self.buf += data
@@ -240,10 +273,7 @@ class Server:
             consumed = self._unpack_bytes(len(self.buf) - self.offset)
             return f"wopAddToStore baseName:{baseName} fixed:{fixed} recursive:{recursive} hashType:{hashType} consumed:{consumed}"
         elif self.state == "wopBuildPaths":
-            count, = self._unpack("L")
-            paths = []
-            for _ in range(count):
-                paths.append(self._unpack_string())
+            paths = self._unpack_list_of_strings()
             mode, = self._unpack("L")
             self.state = "running"
             return f"wopBuildPaths mode:{mode} {paths}"
