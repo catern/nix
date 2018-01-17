@@ -6,6 +6,9 @@ import os
 import selectors
 import struct
 
+import nar
+import construct
+
 sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 
 server_address = "/nix/var/nix/daemon-socket/socket"
@@ -30,7 +33,7 @@ class Message:
 
 WORKER_MAGIC_1 = 0x6e697863
 WORKER_MAGIC_2 = 0x6478696f
-op_to_num = {
+stderr_op_to_num = {
     "STDERR_NEXT": 0x6f6c6d67,
     "STDERR_READ": 0x64617461,
     "STDERR_WRITE": 0x64617416,
@@ -40,7 +43,6 @@ op_to_num = {
     "STDERR_STOP_ACTIVITY": 0x53544f50,
     "STDERR_RESULT": 0x52534c54,
 }
-num_to_op = { num:op for (op, num) in op_to_num.items() }
 wop_to_num = {
     "wopIsValidPath": 1,
     "wopHasSubstitutes": 3,
@@ -80,11 +82,121 @@ wop_to_num = {
     "wopAddToStoreNar": 39,
     "wopQueryMissing": 40,
 }
+nixstr = construct.Aligned(8, construct.PascalString(construct.Int64ul, encoding="utf8"))
+from construct import Struct, Const, Int64ul
+wop_enum = construct.Enum(Int64ul, **wop_to_num)
+stderr_enum = construct.Enum(Int64ul, **stderr_op_to_num)
+wopSetOptions = Struct(
+    "type" / Const(wop_enum, "wopSetOptions"),
+    "keepFailed" / Int64ul,
+    "keepGoing" / Int64ul,
+    "tryFallback" / Int64ul,
+    "verbosity" / Int64ul,
+    "maxBuildJobs" / Int64ul,
+    "maxSilentTime" / Int64ul,
+    "useBuildHook" / Int64ul,
+    "verboseBuild" / Int64ul,
+    "logType" / Int64ul,
+    "printBuildTrace" / Int64ul,
+    "buildCores" / Int64ul,
+    "useSubstitutes" / Int64ul,
+    "overrides" / construct.PrefixedArray(Int64ul, Struct(
+        "option" / nixstr,
+        "value" / nixstr
+    ))
+)
+wopIsValidPath = Struct(
+    "type" / Const(wop_enum, "wopIsValidPath"),
+    "path" / nixstr
+)
+wopEnsurePath = Struct(
+    "type" / Const(wop_enum, "wopEnsurePath"),
+    "path" / nixstr
+)
+wopAddToStore = Struct(
+    "type" / Const(wop_enum, "wopAddToStore"),
+    "baseName" / nixstr,
+    "fixed" / Int64ul,
+    "recursive" / Int64ul,
+    "hashType" / nixstr,
+    "nar" / nar.dump
+)
+wopBuildPaths = Struct(
+    "type" / Const(wop_enum, "wopBuildPaths"),
+    "paths" / construct.PrefixedArray(Int64ul, nixstr),
+    "mode" / Int64ul
+)
+wopQueryPathInfo = Struct(
+    "type" / Const(wop_enum, "wopQueryPathInfo"),
+    "path" / nixstr
+)
+operation = Struct(
+    "value"/construct.Select(
+        wopSetOptions,
+        wopAddToStore,
+        wopIsValidPath,
+        wopEnsurePath,
+        wopBuildPaths,
+        wopQueryPathInfo,
+        Struct("just_type"/wop_enum)),
+    "rest"/construct.GreedyBytes,
+)
+
 num_to_wop = { num:wop for (wop, num) in wop_to_num.items() }
 
 def must_equal(a, b):
     if a != b:
         raise Exception("protocol error:", a, "!=", b)
+
+empty_response = Struct(
+)
+int_response = Struct(
+    "ret" / Int64ul
+)
+path_response = Struct(
+    "path" / nixstr
+)
+pathinfo_response = Struct(
+    # daemon version 17 and above
+    # "valid" / Int64ul,
+    "deriver"/nixstr,
+    "narHash"/nixstr,
+    "references" / construct.PrefixedArray(Int64ul, nixstr),
+    "registrationTime"/Int64ul,
+    "narSize"/Int64ul,
+    # daemon version 16 and above
+    # "ultimate"/Int64ul,
+    # "sigs" / construct.PrefixedArray(Int64ul, nixstr),
+    # "ca"/nixstr,
+)
+wop_response_parsers = {
+    "wopSetOptions": empty_response,
+    "wopIsValidPath": int_response,
+    "wopEnsurePath": int_response,
+    "wopBuildPaths": int_response,
+    "wopAddToStore": path_response,
+    "wopQueryPathInfo": pathinfo_response,
+}
+def parse_wop(wop, bs):
+    if wop in wop_response_parsers:
+        parser = wop_response_parsers[wop]
+        everything = Struct(
+            "value"/parser,
+            "rest"/construct.GreedyBytes
+        )
+        parsed = everything.parse(bs)
+        return parsed.value, parsed.rest
+    else:
+        return None, bs
+
+stderr = Struct(
+    "value"/Const(stderr_enum, "STDERR_LAST"),
+    "rest"/construct.GreedyBytes
+)
+server_header = Struct(
+    Const(Int64ul, WORKER_MAGIC_2),
+    "server_version"/Int64ul
+)
 
 class Client:
     def __init__(self):
@@ -97,23 +209,9 @@ class Client:
         self.offset += struct.calcsize(fmt)
         return ret
 
-    def _unpack_bytes(self, n):
-        ret = self.buf[self.offset:self.offset+n]
-        self.offset += n
-        return ret
-
-    def _unpack_string(self):
-        size, = self._unpack("L")
-        s = self._unpack_bytes(size).decode()
-        padding_size = 8 - (size % 8)
-        padding = self._unpack_bytes(padding_size)
-        return s
-
-    def _unpack_list_of_strings(self):
-        count, = self._unpack("L")
-        ret = []
-        for _ in range(count):
-            ret.append(self._unpack_string())
+    def _unpack_rest(self):
+        ret = self.buf[self.offset:]
+        self.offset += len(ret)
         return ret
 
     def feed_data_from_server(self, data):
@@ -123,37 +221,20 @@ class Client:
             must_equal(magic, WORKER_MAGIC_2)
             self.state = "running"
             return f"WORKER_MAGIC_2 server_version:{server_version:#0x}"
-        elif self.state in ["wopSetOptions"]:
-            # no response
-            op_num, = self._unpack("L")
-            op = num_to_op[op_num]
+        else:
+            parsed = stderr.parse(self._unpack_rest())
+            stderr_value = parsed.value
+            rest = parsed.rest
+            wop = self.state
             self.state = "running"
-            return f"{op}"
-        elif self.state in ["wopIsValidPath", "wopEnsurePath", "wopBuildPaths"]:
-            # single int response
-            op_num, = self._unpack("L")
-            op = num_to_op[op_num]
-            response, = self._unpack("L")
-            self.state = "running"
-            return f"{op} response:{response}"
-        elif self.state in ["wopAddToStore"]:
-            op_num, = self._unpack("L")
-            op = num_to_op[op_num]
-            imported_path = self._unpack_string()
-            return f"{op} imported_path:{imported_path}"
-        elif self.state == "running":
-            op_num, = self._unpack("L")
-            op = num_to_op[op_num]
-            additional = len(self.buf) - self.offset
-            if additional == 8:
-                response, = self._unpack("L")
-                return f"{op} response:{response}"
-            elif additional == 0:
-                return f"{op}"
+            value, rest = parse_wop(wop, rest)
+            if value is not None:
+                if len(rest) == 0:
+                    return f"{stderr_value} wop:{wop} response:{value}"
+                else:
+                    return f"{stderr_value} wop:{wop} response:{value} rest:{rest}"
             else:
-                eprint(f"consuming {additional} additional bytes")
-                consumed = self._unpack_bytes(additional)
-                return f"{op} consumed:{consumed}"
+                return f"{stderr_value} state:{wop} {rest}"
         raise Exception("unknown client state", self.state, "bytes", self.buf[self.offset:])
 
     def send_wop(self, wop):
@@ -206,6 +287,10 @@ class Server:
             ret.append(self._unpack_string())
         return ret
 
+    def _unpack_rest(self):
+        additional = len(self.buf) - self.offset
+        return self._unpack_bytes(len(self.buf) - self.offset)
+
     def feed_data(self, data):
         self.buf += data
         # remaining = len(self.buf) - self.offset
@@ -232,75 +317,19 @@ class Server:
             ret += f"reserve_space:{reserve_space}"
             self.state = "running"
             return ret
-        elif self.state == "wopSetOptions":
-            keepFailed, keepGoing, tryFallback, verbosity, maxBuildJobs, maxSilentTime, useBuildHook, verboseBuild, logType, printBuildTrace, buildCores, useSubstitutes, numOverrides = self._unpack("L"*13)
-            ret = ("wopSetOptions "
-                   f"keepFailed:{keepFailed} "
-                   f"keepGoing:{keepGoing} "
-                   f"tryFallback:{tryFallback} "
-                   f"verbosity:{verbosity} "
-                   f"maxBuildJobs:{maxBuildJobs} "
-                   f"maxSilentTime:{maxSilentTime} "
-                   f"useBuildHook:{useBuildHook} "
-                   f"verboseBuild:{verboseBuild} "
-                   f"logType:{logType} "
-                   f"printBuildTrace:{printBuildTrace} "
-                   f"buildCores:{buildCores} "
-                   f"useSubstitutes:{useSubstitutes} "
-                   f"numOverrides:{numOverrides}"
-            )
-            if numOverrides != 0:
-                overrides = []
-                for _ in range(numOverrides):
-                    overrides.append((self._unpack_string(), self._unpack_string()))
-                ret += f" {overrides}"
-            self.state = "running"
-            return ret
-        elif self.state == "wopIsValidPath":
-            s = self._unpack_string()
-            self.state = "running"
-            return f"wopIsValidPath {s}"
-        elif self.state == "wopEnsurePath":
-            s = self._unpack_string()
-            self.state = "running"
-            return f"wopEnsurePath {s}"
-        elif self.state == "wopAddToStore":
-            baseName = self._unpack_string()
-            fixed, recursive = self._unpack("LL")
-            hashType = self._unpack_string()
-            self.state = "running"
-            additional = len(self.buf) - self.offset
-            consumed = self._unpack_bytes(len(self.buf) - self.offset)
-            return f"wopAddToStore baseName:{baseName} fixed:{fixed} recursive:{recursive} hashType:{hashType} consumed:{consumed}"
-        elif self.state == "wopBuildPaths":
-            paths = self._unpack_list_of_strings()
-            mode, = self._unpack("L")
-            self.state = "running"
-            return f"wopBuildPaths mode:{mode} {paths}"
         elif self.state == "running":
-            num, = self._unpack("L")
-            additional = len(self.buf) - self.offset
-            if num in num_to_wop:
-                wop = num_to_wop[num]
-                if wop in ["wopSetOptions", "wopIsValidPath", "wopEnsurePath", "wopAddToStore", "wopBuildPaths"]:
-                    self.state = wop
-                    ret = self.feed_data_from_client(bytes())
-                    # lazy hack
-                    self.impl.wop_called(wop)
-                    return ret
-                else:
-                    eprint(f"consuming {additional} additional bytes")
-                    consumed = self._unpack_bytes(additional)
-                    return f"{wop} consumed:{consumed}"
-            elif num in num_to_op:
-                op = num_to_op[num]
-                eprint(f"consuming {additional} additional bytes")
-                consumed = self._unpack_bytes(additional)
-                return f"{op} consumed:{consumed}"
+            parsed = operation.parse(self._unpack_rest())
+            val = parsed.value
+            self.offset -= len(parsed.rest)
+            if "type" in val:
+                # lazy hack
+                self.impl.wop_called(val.type)
+                return val
             else:
-                eprint(f"consuming {additional} additional bytes")
-                consumed = self._unpack_bytes(additional)
-                return f"num:{num} consumed:{consumed}"
+                wop = val.just_type
+                consumed = self._unpack_rest()
+                eprint(f"consuming {len(consumed)} additional bytes")
+                return f"{wop} consumed:{consumed}"
         raise Exception("unknown server state", self.state, "bytes", self.buf[self.offset:])
 
 client = Client()
