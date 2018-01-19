@@ -9,27 +9,9 @@ import struct
 import nar
 import construct
 
-sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-
-server_address = "/nix/var/nix/daemon-socket/socket"
-sock.connect(server_address)
-
-sel = selectors.DefaultSelector()
-
-sel.register(sock, selectors.EVENT_READ)
-sel.register(sys.stdin.buffer, selectors.EVENT_READ)
-
 def eprint(*args, **kwargs):
     kwargs['file'] = sys.stderr
     print(*args, **kwargs)
-
-class Message:
-    def __init__(self, data, string_rep=None):
-        self.data = data
-        self.string_rep = string_rep
-
-    def __str__(self):
-        return self.string_rep
 
 WORKER_MAGIC_1 = 0x6e697863
 WORKER_MAGIC_2 = 0x6478696f
@@ -121,6 +103,12 @@ wopAddToStore = Struct(
     "hashType" / nixstr,
     "nar" / nar.dump
 )
+wopAddTextToStore = Struct(
+    "type" / Const(wop_enum, "wopAddTextToStore"),
+    "baseName" / nixstr,
+    "string" / nixstr,
+    "references" / construct.PrefixedArray(Int64ul, nixstr)
+)
 wopBuildPaths = Struct(
     "type" / Const(wop_enum, "wopBuildPaths"),
     "paths" / construct.PrefixedArray(Int64ul, nixstr),
@@ -130,16 +118,52 @@ wopQueryPathInfo = Struct(
     "type" / Const(wop_enum, "wopQueryPathInfo"),
     "path" / nixstr
 )
-operation = Struct(
-    "value"/construct.Select(
+wopQueryReferrers = Struct(
+    "type" / Const(wop_enum, "wopQueryReferrers"),
+    "path" / nixstr
+)
+wopQueryDerivationOutputs = Struct(
+    "type" / Const(wop_enum, "wopQueryDerivationOutputs"),
+    "path" / nixstr
+)
+wopAddTempRoot = Struct(
+    "type" / Const(wop_enum, "wopAddTempRoot"),
+    "path" / nixstr
+)
+wopFindRoots = Struct(
+    "type" / Const(wop_enum, "wopFindRoots")
+)
+gc_action_to_num = {
+    "gcReturnLive": 0,
+    "gcReturnDead": 1,
+    "gcDeleteDead": 2,
+    "gcDeleteSpecific": 3,
+}
+gc_action_enum = construct.Enum(Int64ul, **gc_action_to_num)
+wopCollectGarbage = Struct(
+    "type" / Const(wop_enum, "wopCollectGarbage"),
+    "action" / gc_action_enum,
+    "pathsToDelete" / construct.PrefixedArray(Int64ul, nixstr),
+    "ignoreLiveness" / Int64ul,
+    "maxFreed" / Int64ul,
+    # obselete fields
+    Int64ul,
+    Int64ul,
+    Int64ul
+)
+operation = construct.Select(
         wopSetOptions,
         wopAddToStore,
+        wopAddTextToStore,
         wopIsValidPath,
         wopEnsurePath,
         wopBuildPaths,
         wopQueryPathInfo,
-        Struct("just_type"/wop_enum)),
-    "rest"/construct.GreedyBytes,
+        wopQueryReferrers,
+        wopQueryDerivationOutputs,
+        wopAddTempRoot,
+        wopFindRoots,
+        wopCollectGarbage
 )
 
 num_to_wop = { num:wop for (wop, num) in wop_to_num.items() }
@@ -148,6 +172,10 @@ def must_equal(a, b):
     if a != b:
         raise Exception("protocol error:", a, "!=", b)
 
+map_entry = Struct(
+    "key" / nixstr,
+    "value" / nixstr
+)
 empty_response = Struct(
 )
 int_response = Struct(
@@ -155,6 +183,12 @@ int_response = Struct(
 )
 path_response = Struct(
     "path" / nixstr
+)
+paths_response = Struct(
+    "paths" / construct.PrefixedArray(Int64ul, nixstr)
+)
+map_response = Struct(
+    "entries" / construct.PrefixedArray(Int64ul, map_entry)
 )
 pathinfo_response = Struct(
     # daemon version 17 and above
@@ -169,13 +203,25 @@ pathinfo_response = Struct(
     # "sigs" / construct.PrefixedArray(Int64ul, nixstr),
     # "ca"/nixstr,
 )
+wopCollectGarbage_response = Struct(
+    "collectedPaths" / construct.PrefixedArray(Int64ul, nixstr),
+    "bytesFreed"/Int64ul,
+    # obsolete
+    Int64ul,
+)
 wop_response_parsers = {
     "wopSetOptions": empty_response,
     "wopIsValidPath": int_response,
     "wopEnsurePath": int_response,
     "wopBuildPaths": int_response,
     "wopAddToStore": path_response,
+    "wopAddTextToStore": path_response,
     "wopQueryPathInfo": pathinfo_response,
+    "wopQueryReferrers": paths_response,
+    "wopQueryDerivationOutputs": paths_response,
+    "wopAddTempRoot": int_response,
+    "wopFindRoots": map_response,
+    "wopCollectGarbage": wopCollectGarbage_response,
 }
 def parse_wop(wop, bs):
     if wop in wop_response_parsers:
@@ -189,14 +235,116 @@ def parse_wop(wop, bs):
     else:
         return None, bs
 
+stderr_write = Struct(
+    "type"/Const(stderr_enum, "STDERR_WRITE"),
+    "data"/nixstr
+)
+stderr_read = Struct(
+    "type"/Const(stderr_enum, "STDERR_READ"),
+)
+stderr_error = Struct(
+    "type"/Const(stderr_enum, "STDERR_ERROR"),
+    "error"/nixstr,
+    "status"/Int64ul
+)
+stderr_next = Struct(
+    "type"/Const(stderr_enum, "STDERR_NEXT"),
+    "data"/nixstr
+)
+logger_field_type_enum = construct.Enum(Int64ul,
+    int=0,
+    string=1
+)
+logger_field = construct.Select(
+    Struct(
+        "type"/Const(logger_field_type_enum, "int"),
+        "number"/Int64ul
+    ),
+    Struct(
+        "type"/Const(logger_field_type_enum, "string"),
+        "number"/nixstr
+))
+activity_id = Int64ul
+verbosity_level_to_dict = {
+    "lvlError": 0,
+    "lvlInfo": 1,
+    "lvlTalkative": 2,
+    "lvlChatty": 3,
+    "lvlDebug": 4,
+    "lvlVomit": 5,
+}
+verbosity_level_enum = construct.Enum(Int64ul, **verbosity_level_to_dict)
+activity_type_to_dict = {
+    "actUnknown": 0,
+    "actCopyPath": 100,
+    "actDownload": 101,
+    "actRealise": 102,
+    "actCopyPaths": 103,
+    "actBuilds": 104,
+    "actBuild": 105,
+    "actOptimiseStore": 106,
+    "actVerifyPaths": 107,
+    "actSubstitute": 108,
+    "actQueryPathInfo": 109,
+}
+activity_type_enum = construct.Enum(Int64ul, **activity_type_to_dict)
+stderr_start_activity = Struct(
+    "type"/Const(stderr_enum, "STDERR_START_ACTIVITY"),
+    "activity"/activity_id,
+    "verbosity_level"/verbosity_level_enum,
+    "activity_type"/activity_type_enum,
+    "string"/nixstr,
+    "fields"/construct.PrefixedArray(Int64ul, logger_field),
+    "parent"/activity_id
+)
+stderr_stop_activity = Struct(
+    "type"/Const(stderr_enum, "STDERR_STOP_ACTIVITY"),
+    "activity"/activity_id
+)
+result_type_to_dict = {
+    "resFileLinked": 100,
+    "resBuildLogLine": 101,
+    "resUntrustedPath": 102,
+    "resCorruptedPath": 103,
+    "resSetPhase": 104,
+    "resProgress": 105,
+    "resSetExpected": 106,
+}
+result_type_enum = construct.Enum(Int64ul, **result_type_to_dict)
+stderr_result = Struct(
+    "type"/Const(stderr_enum, "STDERR_RESULT"),
+    "activity"/activity_id,
+    "result_type"/result_type_enum,
+    "fields"/construct.PrefixedArray(Int64ul, logger_field),
+)
+stderr_last = Struct(
+    "type"/Const(stderr_enum, "STDERR_LAST")
+)
+stderr_operation = construct.Select(
+    stderr_write,
+    stderr_read,
+    stderr_error,
+    stderr_next,
+    stderr_start_activity,
+    stderr_stop_activity,
+    stderr_result,
+    stderr_last
+)
 stderr = Struct(
-    "value"/Const(stderr_enum, "STDERR_LAST"),
-    "rest"/construct.GreedyBytes
+    construct.Probe(),
+    "stderr"/construct.GreedyRange(stderr_operation),
+    construct.Probe(),
+    Const(stderr_enum, "STDERR_LAST")
 )
 server_header = Struct(
     Const(Int64ul, WORKER_MAGIC_2),
     "server_version"/Int64ul
 )
+def parse_with(subcon, bys):
+    return Struct(
+        construct.Embedded(construct.Select(construct.Struct("value"/subcon), Struct())),
+        "rest"/construct.GreedyBytes
+    ).parse(bys)
 
 class Client:
     def __init__(self):
@@ -222,17 +370,21 @@ class Client:
             self.state = "running"
             return f"WORKER_MAGIC_2 server_version:{server_version:#0x}"
         else:
-            parsed = stderr.parse(self._unpack_rest())
+            rest = self._unpack_rest()
+            parsed = parse_with(stderr_operation, rest)
             stderr_value = parsed.value
             rest = parsed.rest
+            if stderr_value.type != "STDERR_LAST":
+                self.offset -= len(rest)
+                return f"{stderr_value}"
             wop = self.state
             self.state = "running"
             value, rest = parse_wop(wop, rest)
             if value is not None:
                 if len(rest) == 0:
-                    return f"{stderr_value} wop:{wop} response:{value}"
+                    return f"wop:{wop} response:{value}"
                 else:
-                    return f"{stderr_value} wop:{wop} response:{value} rest:{rest}"
+                    return f"wop:{wop} response:{value} rest:{rest}"
             else:
                 return f"{stderr_value} state:{wop} {rest}"
         raise Exception("unknown client state", self.state, "bytes", self.buf[self.offset:])
@@ -291,6 +443,9 @@ class Server:
         additional = len(self.buf) - self.offset
         return self._unpack_bytes(len(self.buf) - self.offset)
 
+    def _rest(self):
+        return self.buf[self.offset:]
+
     def feed_data(self, data):
         self.buf += data
         # remaining = len(self.buf) - self.offset
@@ -318,44 +473,70 @@ class Server:
             self.state = "running"
             return ret
         elif self.state == "running":
-            parsed = operation.parse(self._unpack_rest())
-            val = parsed.value
+            rest = self._unpack_rest()
+            parsed = parse_with(operation, rest)
             self.offset -= len(parsed.rest)
-            if "type" in val:
-                # lazy hack
-                self.impl.wop_called(val.type)
-                return val
-            else:
-                wop = val.just_type
-                consumed = self._unpack_rest()
-                eprint(f"consuming {len(consumed)} additional bytes")
-                return f"{wop} consumed:{consumed}"
+            if "value" not in parsed:
+                eprint("working on", wop_enum.parse(self._rest()[:8]))
+                return None
+            val = parsed.value
+            self.impl.wop_called(val.type)
+            return val
         raise Exception("unknown server state", self.state, "bytes", self.buf[self.offset:])
 
-client = Client()
-server = Server(impl=DissectorAdaptor(client))
-while True:
-    tuples = sel.select()
-    for key, events in tuples:
-        if key.fileobj is sock:
-            data = sock.recv(4096)
-            if len(data) == 0:
-                raise Exception("got EOF on socket")
-            response = client.feed_data_from_server(data)
-            eprint("<", response)
-            sent = os.write(sys.stdout.buffer.fileno(), data)
-            if sent != len(data):
-                raise Exception("partial send from sock to stdout")
-        if key.fileobj is sys.stdin.buffer:
-            data = os.read(sys.stdin.buffer.fileno(), 4096)
-            if len(data) == 0:
-                raise Exception("got EOF on stdin")
-            eprint(">", server.feed_data_from_client(data))
-            while len(server.buf) > server.offset:
-                ret = server.feed_data_from_client(bytes())
-                if ret is None:
-                    break
-                eprint(">", ret)
-            sent = sock.send(data)
-            if sent != len(data):
-                raise Exception("partial send from stdin to sock")
+def main():
+    client = Client()
+    server = Server(impl=DissectorAdaptor(client))
+    
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    
+    server_address = "/nix/var/nix/daemon-socket/socket"
+    sock.connect(server_address)
+    
+    sel = selectors.DefaultSelector()
+    
+    sel.register(sock, selectors.EVENT_READ)
+    sel.register(sys.stdin.buffer, selectors.EVENT_READ)
+
+    while len(sel.get_map()) > 0:
+        tuples = sel.select()
+        for key, events in tuples:
+            if key.fileobj is sock:
+                data = sock.recv(4096)
+                if len(data) == 0:
+                    eprint("got eof on socket")
+                    sel.unregister(sock)
+                    sys.stdout.close()
+                    continue
+                ret = client.feed_data_from_server(data)
+                if ret is not None:
+                    eprint("<", ret)
+                while len(client.buf) > client.offset:
+                    ret = client.feed_data_from_server(bytes())
+                    if ret is None:
+                        break
+                    eprint("<", ret)
+                sent = os.write(sys.stdout.buffer.fileno(), data)
+                if sent != len(data):
+                    raise Exception("partial send from sock to stdout")
+            if key.fileobj is sys.stdin.buffer:
+                data = os.read(sys.stdin.buffer.fileno(), 4096)
+                if len(data) == 0:
+                    eprint("got eof on stdin")
+                    sel.unregister(sys.stdin.buffer)
+                    sock.shutdown(socket.SHUT_WR)
+                    continue
+                ret = server.feed_data_from_client(data)
+                if ret is not None:
+                    eprint(">", ret)
+                while len(server.buf) > server.offset:
+                    ret = server.feed_data_from_client(bytes())
+                    if ret is None:
+                        break
+                    eprint(">", ret)
+                sent = sock.send(data)
+                if sent != len(data):
+                    raise Exception("partial send from stdin to sock")
+    eprint("DONE")
+if __name__ == '__main__':
+    main()
