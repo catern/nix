@@ -126,12 +126,23 @@ wopQueryDerivationOutputs = Struct(
     "type" / Const(wop_enum, "wopQueryDerivationOutputs"),
     "path" / nixstr
 )
+wopQuerySubstitutablePathInfos = Struct(
+    "type" / Const(wop_enum, "wopQuerySubstitutablePathInfos"),
+    "paths" / construct.PrefixedArray(Int64ul, nixstr),
+)
 wopAddTempRoot = Struct(
     "type" / Const(wop_enum, "wopAddTempRoot"),
     "path" / nixstr
 )
+wopAddIndirectRoot = Struct(
+    "type" / Const(wop_enum, "wopAddIndirectRoot"),
+    "path" / nixstr
+)
 wopFindRoots = Struct(
     "type" / Const(wop_enum, "wopFindRoots")
+)
+wopSyncWithGC = Struct(
+    "type" / Const(wop_enum, "wopSyncWithGC")
 )
 gc_action_to_num = {
     "gcReturnLive": 0,
@@ -152,18 +163,21 @@ wopCollectGarbage = Struct(
     Int64ul
 )
 operation = construct.Select(
-        wopSetOptions,
-        wopAddToStore,
-        wopAddTextToStore,
-        wopIsValidPath,
-        wopEnsurePath,
-        wopBuildPaths,
-        wopQueryPathInfo,
-        wopQueryReferrers,
-        wopQueryDerivationOutputs,
-        wopAddTempRoot,
-        wopFindRoots,
-        wopCollectGarbage
+    wopSetOptions,
+    wopAddToStore,
+    wopAddTextToStore,
+    wopIsValidPath,
+    wopEnsurePath,
+    wopBuildPaths,
+    wopQueryPathInfo,
+    wopQueryReferrers,
+    wopQueryDerivationOutputs,
+    wopQuerySubstitutablePathInfos,
+    wopAddTempRoot,
+    wopAddIndirectRoot,
+    wopFindRoots,
+    wopSyncWithGC,
+    wopCollectGarbage
 )
 
 num_to_wop = { num:wop for (wop, num) in wop_to_num.items() }
@@ -209,6 +223,16 @@ wopCollectGarbage_response = Struct(
     # obsolete
     Int64ul,
 )
+substitutable_pathinfo = Struct(
+    "path"/nixstr,
+    "deriver"/nixstr,
+    "references"/construct.PrefixedArray(Int64ul, nixstr),
+    "downloadSize"/Int64ul,
+    "narSize"/Int64ul
+)
+wopQuerySubstitutablePathInfos_response = Struct(
+    "infos" / construct.PrefixedArray(Int64ul, substitutable_pathinfo)
+)
 wop_response_parsers = {
     "wopSetOptions": empty_response,
     "wopIsValidPath": int_response,
@@ -219,8 +243,11 @@ wop_response_parsers = {
     "wopQueryPathInfo": pathinfo_response,
     "wopQueryReferrers": paths_response,
     "wopQueryDerivationOutputs": paths_response,
+    "wopQuerySubstitutablePathInfos": wopQuerySubstitutablePathInfos_response,
     "wopAddTempRoot": int_response,
+    "wopAddIndirectRoot": int_response,
     "wopFindRoots": map_response,
+    "wopSyncWithGC": int_response,
     "wopCollectGarbage": wopCollectGarbage_response,
 }
 def parse_wop(wop, bs):
