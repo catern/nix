@@ -16,16 +16,6 @@ def eprint(*args, **kwargs):
 
 WORKER_MAGIC_1 = 0x6e697863
 WORKER_MAGIC_2 = 0x6478696f
-stderr_op_to_num = {
-    "STDERR_NEXT": 0x6f6c6d67,
-    "STDERR_READ": 0x64617461,
-    "STDERR_WRITE": 0x64617416,
-    "STDERR_LAST": 0x616c7473,
-    "STDERR_ERROR": 0x63787470,
-    "STDERR_START_ACTIVITY": 0x53545254,
-    "STDERR_STOP_ACTIVITY": 0x53544f50,
-    "STDERR_RESULT": 0x52534c54,
-}
 wop_to_num = {
     "wopIsValidPath": 1,
     "wopHasSubstitutes": 3,
@@ -67,7 +57,6 @@ wop_to_num = {
 }
 nixstr = construct.Aligned(8, construct.PascalString(construct.Int64ul, encoding="utf8"))
 wop_enum = construct.Enum(Int64ul, **wop_to_num)
-stderr_enum = construct.Enum(Int64ul, **stderr_op_to_num)
 wopSetOptions = Struct(
     "keepFailed" / Int64ul,
     "keepGoing" / Int64ul,
@@ -139,16 +128,6 @@ op_request = {
     "wopSyncWithGC": Struct(),
     "wopCollectGarbage":wopCollectGarbage,
 }
-operation = Struct(
-    "type" / wop_enum,
-    construct.Embedded(construct.Switch(construct.this.type, op_request))
-)
-
-num_to_wop = { num:wop for (wop, num) in wop_to_num.items() }
-
-def must_equal(a, b):
-    if a != b:
-        raise Exception("protocol error:", a, "!=", b)
 
 map_entry = Struct(
     "key" / nixstr,
@@ -214,35 +193,21 @@ op_response = {
     "wopSyncWithGC": int_response,
     "wopCollectGarbage": wopCollectGarbage_response,
 }
-wop_response_parsers = op_response
 
-def parse_wop(wop, bs):
-    if wop in wop_response_parsers:
-        parser = wop_response_parsers[wop]
-        everything = Struct(
-            "value"/parser,
-            "rest"/construct.GreedyBytes
-        )
-        parsed = everything.parse(bs)
-        return parsed.value, parsed.rest
-    else:
-        return None, bs
-
-stderr_write = Struct(
-    "type"/Const(stderr_enum, "STDERR_WRITE"),
-    "data"/nixstr
-)
-stderr_read = Struct(
-    "type"/Const(stderr_enum, "STDERR_READ"),
-)
+stderr_op_to_num = {
+    "STDERR_NEXT": 0x6f6c6d67,
+    "STDERR_READ": 0x64617461,
+    "STDERR_WRITE": 0x64617416,
+    "STDERR_LAST": 0x616c7473,
+    "STDERR_ERROR": 0x63787470,
+    "STDERR_START_ACTIVITY": 0x53545254,
+    "STDERR_STOP_ACTIVITY": 0x53544f50,
+    "STDERR_RESULT": 0x52534c54,
+}
+stderr_enum = construct.Enum(Int64ul, **stderr_op_to_num)
 stderr_error = Struct(
-    "type"/Const(stderr_enum, "STDERR_ERROR"),
     "error"/nixstr,
     "status"/Int64ul
-)
-stderr_next = Struct(
-    "type"/Const(stderr_enum, "STDERR_NEXT"),
-    "data"/nixstr
 )
 logger_field_type_enum = construct.Enum(Int64ul,
     int=0,
@@ -282,7 +247,6 @@ activity_type_to_dict = {
 }
 activity_type_enum = construct.Enum(Int64ul, **activity_type_to_dict)
 stderr_start_activity = Struct(
-    "type"/Const(stderr_enum, "STDERR_START_ACTIVITY"),
     "activity"/activity_id,
     "verbosity_level"/verbosity_level_enum,
     "activity_type"/activity_type_enum,
@@ -291,7 +255,6 @@ stderr_start_activity = Struct(
     "parent"/activity_id
 )
 stderr_stop_activity = Struct(
-    "type"/Const(stderr_enum, "STDERR_STOP_ACTIVITY"),
     "activity"/activity_id
 )
 result_type_to_dict = {
@@ -305,94 +268,20 @@ result_type_to_dict = {
 }
 result_type_enum = construct.Enum(Int64ul, **result_type_to_dict)
 stderr_result = Struct(
-    "type"/Const(stderr_enum, "STDERR_RESULT"),
     "activity"/activity_id,
     "result_type"/result_type_enum,
     "fields"/construct.PrefixedArray(Int64ul, logger_field),
 )
-stderr_last = Struct(
-    "type"/Const(stderr_enum, "STDERR_LAST")
-)
-stderr_operation = construct.Select(
-    stderr_write,
-    stderr_read,
-    stderr_error,
-    stderr_next,
-    stderr_start_activity,
-    stderr_stop_activity,
-    stderr_result,
-    stderr_last
-)
-stderr = Struct(
-    construct.Probe(),
-    "stderr"/construct.GreedyRange(stderr_operation),
-    construct.Probe(),
-    Const(stderr_enum, "STDERR_LAST")
-)
-server_header = Struct(
-    Const(Int64ul, WORKER_MAGIC_2),
-    "server_version"/Int64ul
-)
-def parse_with(subcon, bys):
-    return Struct(
-        construct.Embedded(construct.Select(construct.Struct("value"/subcon), Struct())),
-        "rest"/construct.GreedyBytes
-    ).parse(bys)
-
-class Client:
-    def __init__(self):
-        self.buf = bytes()
-        self.offset = 0
-        self.state = "start"
-
-    def _unpack(self, fmt):
-        ret = struct.unpack_from(fmt, self.buf, offset=self.offset)
-        self.offset += struct.calcsize(fmt)
-        return ret
-
-    def _unpack_rest(self):
-        ret = self.buf[self.offset:]
-        self.offset += len(ret)
-        return ret
-
-    def feed_data_from_server(self, data):
-        self.buf += data
-        if self.state == "start":
-            magic, server_version = self._unpack("LL")
-            must_equal(magic, WORKER_MAGIC_2)
-            self.state = "running"
-            return f"WORKER_MAGIC_2 server_version:{server_version:#0x}"
-        else:
-            rest = self._unpack_rest()
-            # TODO use construct.Optional instead? need to also wrap it with something to get the bytes consumed then
-            # TODO also need to wrap all my definitions in a version thingy
-            # okay, let's transform this to asyncio calls!
-            # oh, wait, let's do that with the server first
-            parsed = parse_with(stderr_operation, rest)
-            stderr_value = parsed.value
-            rest = parsed.rest
-            if stderr_value.type != "STDERR_LAST":
-                self.offset -= len(rest)
-                return f"{stderr_value}"
-            wop = self.state
-            self.state = "running"
-            value, rest = parse_wop(wop, rest)
-            if value is not None:
-                if len(rest) == 0:
-                    return f"wop:{wop} response:{value}"
-                else:
-                    return f"wop:{wop} response:{value} rest:{rest}"
-            else:
-                return f"{stderr_value} state:{wop} {rest}"
-        raise Exception("unknown client state", self.state, "bytes", self.buf[self.offset:])
-
-    def send_wop(self, wop):
-        pass
-
-    def call_wop(self, wop):
-        self.send_wop(wop)
-        assert(self.state == "running")
-        self.state = wop
+type_to_stderr_packet = {
+    "STDERR_WRITE": Struct("data"/nixstr),
+    "STDERR_READ": Struct(),
+    "STDERR_ERROR": stderr_error,
+    "STDERR_NEXT": Struct("data"/nixstr),
+    "STDERR_START_ACTIVITY": stderr_start_activity,
+    "STDERR_STOP_ACTIVITY": stderr_stop_activity,
+    "STDERR_RESULT": stderr_result,
+    "STDERR_LAST": Struct(),
+}
 
 client_hello = Const(Int64ul, WORKER_MAGIC_1)
 server_hello_ack = Struct(
@@ -405,11 +294,6 @@ client_ack = Struct(
     "cpu_affinity"/construct.If(construct.this.should_set_affinity == 1, Int64ul),
     "reserve_space"/Int64ul,
 )
-
-def async_fd_blocking_reader(fd):
-    async def read():
-        return os.read(fd, 4096)
-    return read
 
 class Callcc:
     def __init__(self, func):
@@ -489,10 +373,11 @@ class ConnectedClient:
         await write_con(op_request[op])
         # TODO need to handle streaming this out in a sane way rather than just printing it
         while True:
-            stderr_packet = await read_con(stderr_operation)
-            if stderr_packet.type == "STDERR_LAST":
+            stderr_packet_type = await read_con(stderr_enum)
+            if stderr_packet_type == "STDERR_LAST":
                 break
-            eprint("[new] <", stderr_packet)
+            stderr_packet = await read_con(type_to_stderr_packet[stderr_packet_type])
+            eprint("[new] <", stderr_packet_type, stderr_packet)
         response = await read_con(op_response[op])
         return response
 
@@ -552,19 +437,19 @@ class PrintingConnectedClient:
         self.client = client
 
     async def call(self, op, request):
-        eprint("[new] >", op, request)
+        eprint(">", op, request)
         response = await self.client.call(op, request)
-        eprint("[new] <", response)
+        eprint("<", response)
 
 def printing_nix_client(read, write):
     real_hello = nix_client(read, write)
     async def hello():
         real_connect_with, server_version = await real_hello()
-        eprint(f"[new] < server connection response, version:{server_version:#0x}")
+        eprint(f"< server connection response, version:{server_version:#0x}")
         async def connect_with(ack):
             client_version = ack['client_version']
             del ack['client_version']
-            eprint(f"[new] > client connection response, version:{client_version:#0x}, ", ack)
+            eprint(f"> client connection response, version:{client_version:#0x}, ", ack)
             real_client = await real_connect_with(ack)
             return PrintingConnectedClient(real_client)
         return connect_with, server_version
@@ -572,6 +457,11 @@ def printing_nix_client(read, write):
 
 async def dummy_write(data):
     eprint("wrote out", data)
+
+def async_fd_blocking_reader(fd):
+    async def read():
+        return os.read(fd, 4096)
+    return read
 
 def main():
     stdin_channel = Channel()
