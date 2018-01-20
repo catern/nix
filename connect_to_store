@@ -476,6 +476,47 @@ def parse_with_con(con, bytes):
     else:
         return None, 0
 
+class ConnectedClient:
+    def __init__(self, read_con, write_con, server_version, client_configuration):
+        self.read_con = read_con
+        self.write_con = write_con
+        self.server_version = server_version
+        self.client_configuration = client_configuration
+
+    async def call(self, op, request):
+        write_con = self.write_con
+        read_con = self.read_con
+        await write_con(op_request[op])
+        # TODO need to handle streaming this out in a sane way rather than just printing it
+        while True:
+            stderr_packet = await read_con(stderr_operation)
+            if stderr_packet.type == "STDERR_LAST":
+                break
+            eprint("[new] <", stderr_packet)
+        response = await read_con(op_response[op])
+        return response
+
+def nix_client(read, write):
+    async def hello():
+        reader = DataPoller(read)
+        async def read_con(con):
+            while True:
+                value, consumed = parse_with_con(con, reader.available())
+                if value is not None:
+                    reader.consume(consumed)
+                    return value
+                await reader.wait_for_more()
+        async def write_con(con):
+            return
+        await write_con(client_hello)
+        server_ack = await read_con(server_hello_ack)
+        server_version = server_ack['server_version']
+        async def connect_with(client_ack_data):
+            await write_con(client_ack)
+            return ConnectedClient(read_con, write_con, server_version, client_ack_data)
+        return connect_with, server_version
+    return hello
+
 class AsyncServer:
     def __init__(self, impl_start, read, write):
         self._impl_start = impl_start
@@ -495,34 +536,48 @@ class AsyncServer:
         async def write_con(con):
             return
         await read_con(client_hello)
+        impl_hello, server_version = await self._impl_start()
         await write_con(server_hello_ack)
         ack = await read_con(client_ack)
-        self.impl = self._impl_start(ack)
+        impl = await impl_hello(ack)
         while True:
             op = await read_con(wop_enum)
             request = await read_con(op_request[op])
             # TODO need to pull stderr out of impl.call
-            response = await self.impl.call(op, request)
+            response = await impl.call(op, request)
             await write_con(op_response[op])
 
-def wrap_old_client_for_new_server(client):
-    class WrappedClient:
-        def __init__(self, ack):
-            eprint("[new] > ack", ack)
+class PrintingConnectedClient:
+    def __init__(self, client):
+        self.client = client
 
-        async def call(self, op, request):
-            eprint("[new] >", op, request)
-            client.call_wop(op)
-    return WrappedClient
+    async def call(self, op, request):
+        eprint("[new] >", op, request)
+        response = await self.client.call(op, request)
+        eprint("[new] <", response)
+
+def printing_nix_client(read, write):
+    real_hello = nix_client(read, write)
+    async def hello():
+        real_connect_with, server_version = await real_hello()
+        eprint(f"[new] < server connection response, version:{server_version:#0x}")
+        async def connect_with(ack):
+            client_version = ack['client_version']
+            del ack['client_version']
+            eprint(f"[new] > client connection response, version:{client_version:#0x}, ", ack)
+            real_client = await real_connect_with(ack)
+            return PrintingConnectedClient(real_client)
+        return connect_with, server_version
+    return hello
 
 async def dummy_write(data):
     eprint("wrote out", data)
 
 def main():
-    client = Client()
-
     stdin_channel = Channel()
-    servobj = AsyncServer(wrap_old_client_for_new_server(client), stdin_channel.recv, dummy_write)
+    stdout_channel = Channel()
+    servobj = AsyncServer(printing_nix_client(stdout_channel.recv, dummy_write),
+                          stdin_channel.recv, dummy_write)
     start(servobj.run())
     
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -545,14 +600,7 @@ def main():
                     sel.unregister(sock)
                     sys.stdout.close()
                     continue
-                ret = client.feed_data_from_server(data)
-                if ret is not None:
-                    eprint("<", ret)
-                while len(client.buf) > client.offset:
-                    ret = client.feed_data_from_server(bytes())
-                    if ret is None:
-                        break
-                    eprint("<", ret)
+                stdout_channel.send(data)
                 sent = os.write(sys.stdout.buffer.fileno(), data)
                 if sent != len(data):
                     raise Exception("partial send from sock to stdout")
