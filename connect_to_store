@@ -8,6 +8,7 @@ import struct
 
 import nar
 import construct
+from construct import Struct, Const, Int64ul, Pass
 
 def eprint(*args, **kwargs):
     kwargs['file'] = sys.stderr
@@ -65,11 +66,9 @@ wop_to_num = {
     "wopQueryMissing": 40,
 }
 nixstr = construct.Aligned(8, construct.PascalString(construct.Int64ul, encoding="utf8"))
-from construct import Struct, Const, Int64ul
 wop_enum = construct.Enum(Int64ul, **wop_to_num)
 stderr_enum = construct.Enum(Int64ul, **stderr_op_to_num)
 wopSetOptions = Struct(
-    "type" / Const(wop_enum, "wopSetOptions"),
     "keepFailed" / Int64ul,
     "keepGoing" / Int64ul,
     "tryFallback" / Int64ul,
@@ -87,16 +86,7 @@ wopSetOptions = Struct(
         "value" / nixstr
     ))
 )
-wopIsValidPath = Struct(
-    "type" / Const(wop_enum, "wopIsValidPath"),
-    "path" / nixstr
-)
-wopEnsurePath = Struct(
-    "type" / Const(wop_enum, "wopEnsurePath"),
-    "path" / nixstr
-)
 wopAddToStore = Struct(
-    "type" / Const(wop_enum, "wopAddToStore"),
     "baseName" / nixstr,
     "fixed" / Int64ul,
     "recursive" / Int64ul,
@@ -104,45 +94,16 @@ wopAddToStore = Struct(
     "nar" / nar.dump
 )
 wopAddTextToStore = Struct(
-    "type" / Const(wop_enum, "wopAddTextToStore"),
     "baseName" / nixstr,
     "string" / nixstr,
     "references" / construct.PrefixedArray(Int64ul, nixstr)
 )
 wopBuildPaths = Struct(
-    "type" / Const(wop_enum, "wopBuildPaths"),
     "paths" / construct.PrefixedArray(Int64ul, nixstr),
     "mode" / Int64ul
 )
-wopQueryPathInfo = Struct(
-    "type" / Const(wop_enum, "wopQueryPathInfo"),
-    "path" / nixstr
-)
-wopQueryReferrers = Struct(
-    "type" / Const(wop_enum, "wopQueryReferrers"),
-    "path" / nixstr
-)
-wopQueryDerivationOutputs = Struct(
-    "type" / Const(wop_enum, "wopQueryDerivationOutputs"),
-    "path" / nixstr
-)
 wopQuerySubstitutablePathInfos = Struct(
-    "type" / Const(wop_enum, "wopQuerySubstitutablePathInfos"),
     "paths" / construct.PrefixedArray(Int64ul, nixstr),
-)
-wopAddTempRoot = Struct(
-    "type" / Const(wop_enum, "wopAddTempRoot"),
-    "path" / nixstr
-)
-wopAddIndirectRoot = Struct(
-    "type" / Const(wop_enum, "wopAddIndirectRoot"),
-    "path" / nixstr
-)
-wopFindRoots = Struct(
-    "type" / Const(wop_enum, "wopFindRoots")
-)
-wopSyncWithGC = Struct(
-    "type" / Const(wop_enum, "wopSyncWithGC")
 )
 gc_action_to_num = {
     "gcReturnLive": 0,
@@ -152,7 +113,6 @@ gc_action_to_num = {
 }
 gc_action_enum = construct.Enum(Int64ul, **gc_action_to_num)
 wopCollectGarbage = Struct(
-    "type" / Const(wop_enum, "wopCollectGarbage"),
     "action" / gc_action_enum,
     "pathsToDelete" / construct.PrefixedArray(Int64ul, nixstr),
     "ignoreLiveness" / Int64ul,
@@ -162,22 +122,26 @@ wopCollectGarbage = Struct(
     Int64ul,
     Int64ul
 )
-operation = construct.Select(
-    wopSetOptions,
-    wopAddToStore,
-    wopAddTextToStore,
-    wopIsValidPath,
-    wopEnsurePath,
-    wopBuildPaths,
-    wopQueryPathInfo,
-    wopQueryReferrers,
-    wopQueryDerivationOutputs,
-    wopQuerySubstitutablePathInfos,
-    wopAddTempRoot,
-    wopAddIndirectRoot,
-    wopFindRoots,
-    wopSyncWithGC,
-    wopCollectGarbage
+op_request = {
+    "wopSetOptions":wopSetOptions,
+    "wopAddToStore":wopAddToStore,
+    "wopAddTextToStore":wopAddTextToStore,
+    "wopIsValidPath": Struct("path"/nixstr),
+    "wopEnsurePath": Struct("path"/nixstr),
+    "wopBuildPaths":wopBuildPaths,
+    "wopQueryPathInfo": Struct("path"/nixstr),
+    "wopQueryReferrers": Struct("path"/nixstr),
+    "wopQueryDerivationOutputs": Struct("path"/nixstr),
+    "wopQuerySubstitutablePathInfos":wopQuerySubstitutablePathInfos,
+    "wopAddTempRoot": Struct("path"/nixstr),
+    "wopAddIndirectRoot": Struct("path"/nixstr),
+    "wopFindRoots": Struct(),
+    "wopSyncWithGC": Struct(),
+    "wopCollectGarbage":wopCollectGarbage,
+}
+operation = Struct(
+    "type" / wop_enum,
+    construct.Embedded(construct.Switch(construct.this.type, op_request))
 )
 
 num_to_wop = { num:wop for (wop, num) in wop_to_num.items() }
@@ -233,7 +197,7 @@ substitutable_pathinfo = Struct(
 wopQuerySubstitutablePathInfos_response = Struct(
     "infos" / construct.PrefixedArray(Int64ul, substitutable_pathinfo)
 )
-wop_response_parsers = {
+op_response = {
     "wopSetOptions": empty_response,
     "wopIsValidPath": int_response,
     "wopEnsurePath": int_response,
@@ -250,6 +214,8 @@ wop_response_parsers = {
     "wopSyncWithGC": int_response,
     "wopCollectGarbage": wopCollectGarbage_response,
 }
+wop_response_parsers = op_response
+
 def parse_wop(wop, bs):
     if wop in wop_response_parsers:
         parser = wop_response_parsers[wop]
@@ -398,6 +364,10 @@ class Client:
             return f"WORKER_MAGIC_2 server_version:{server_version:#0x}"
         else:
             rest = self._unpack_rest()
+            # TODO use construct.Optional instead? need to also wrap it with something to get the bytes consumed then
+            # TODO also need to wrap all my definitions in a version thingy
+            # okay, let's transform this to asyncio calls!
+            # oh, wait, let's do that with the server first
             parsed = parse_with(stderr_operation, rest)
             stderr_value = parsed.value
             rest = parsed.rest
@@ -424,96 +394,136 @@ class Client:
         assert(self.state == "running")
         self.state = wop
 
-class WorkerProtocolAPI:
-    def wop_called(self, wop):
-        raise NotImplementedError
+client_hello = Const(Int64ul, WORKER_MAGIC_1)
+server_hello_ack = Struct(
+    Const(Int64ul, WORKER_MAGIC_2),
+    "server_version"/Int64ul
+)
+client_ack = Struct(
+    "client_version"/Int64ul,
+    "should_set_affinity"/Int64ul,
+    "cpu_affinity"/construct.If(construct.this.should_set_affinity == 1, Int64ul),
+    "reserve_space"/Int64ul,
+)
 
-class DissectorAdaptor(WorkerProtocolAPI):
-    def __init__(self, client):
-        self.client = client
+def async_fd_blocking_reader(fd):
+    async def read():
+        return os.read(fd, 4096)
+    return read
 
-    def wop_called(self, wop):
-        self.client.call_wop(wop)
+class Callcc:
+    def __init__(self, func):
+        self.func = func
 
-class Server:
-    def __init__(self, impl):
+    @staticmethod
+    def yield_up(value):
+        return (yield value)
+
+    def __await__(self):
+        return self.yield_up(self.func)
+
+def callcc(func):
+    return Callcc(func)
+
+def start(coroutine):
+    def trampoline(value):
+        try:
+            f = coroutine.send(value)
+        except StopIteration:
+            return
+        f(trampoline)
+    trampoline(None)
+
+class Channel:
+    def __init__(self):
+        self.cbs = []
+
+    def send(self, value):
+        cbs = self.cbs
+        self.cbs = []
+        for cb in cbs:
+            cb(value)
+
+    def register_callback(self, cb):
+        self.cbs.append(cb)
+
+    async def recv(self):
+        return (await callcc(self.register_callback))
+
+class DataPoller:
+    def __init__(self, read):
+        self._read = read
         self.buf = bytes()
-        self.offset = 0
-        self.state = "start"
-        self.impl = impl
 
-    def _unpack(self, fmt):
-        ret = struct.unpack_from(fmt, self.buf, offset=self.offset)
-        self.offset += struct.calcsize(fmt)
-        return ret
+    async def wait_for_more(self):
+        self.buf += await self._read()
 
-    def _unpack_bytes(self, n):
-        ret = self.buf[self.offset:self.offset+n]
-        self.offset += n
-        return ret
+    def available(self):
+        return self.buf
 
-    def _unpack_string(self):
-        size, = self._unpack("L")
-        s = self._unpack_bytes(size).decode()
-        padding_size = 8 - (size % 8)
-        padding = self._unpack_bytes(padding_size)
-        return s
+    def consume(self, n):
+        self.buf = self.buf[n:]
 
-    def _unpack_list_of_strings(self):
-        count, = self._unpack("L")
-        ret = []
-        for _ in range(count):
-            ret.append(self._unpack_string())
-        return ret
+def parse_with_con(con, bytes):
+    parsed = construct.Optional(Struct(
+        "offset1"/construct.Tell,
+        "value"/con,
+        "offset2"/construct.Tell
+    )).parse(bytes)
+    if parsed is not None:
+        size = parsed["offset2"] - parsed["offset1"]
+        return parsed["value"], size
+    else:
+        return None, 0
 
-    def _unpack_rest(self):
-        additional = len(self.buf) - self.offset
-        return self._unpack_bytes(len(self.buf) - self.offset)
+class AsyncServer:
+    def __init__(self, impl_start, read, write):
+        self._impl_start = impl_start
+        # I suppose this will throw on EOF?
+        self._read = read
+        self._write = write
 
-    def _rest(self):
-        return self.buf[self.offset:]
+    async def run(self):
+        self.reader = DataPoller(self._read)
+        async def read_con(con):
+            while True:
+                value, consumed = parse_with_con(con, self.reader.available())
+                if value is not None:
+                    self.reader.consume(consumed)
+                    return value
+                await self.reader.wait_for_more()
+        async def write_con(con):
+            return
+        await read_con(client_hello)
+        await write_con(server_hello_ack)
+        ack = await read_con(client_ack)
+        self.impl = self._impl_start(ack)
+        while True:
+            op = await read_con(wop_enum)
+            request = await read_con(op_request[op])
+            # TODO need to pull stderr out of impl.call
+            response = await self.impl.call(op, request)
+            await write_con(op_response[op])
 
-    def feed_data(self, data):
-        self.buf += data
-        # remaining = len(self.buf) - self.offset
-        # self.buf = self.buf[self.offset:] + data
-        # self.offset = remaining
-    
-    def feed_data_from_client(self, data):
-        self.feed_data(data)
-        if self.state == "start":
-            magic, = self._unpack("L")
-            must_equal(magic, WORKER_MAGIC_1)
-            self.state = "receive_client_version"
-            return "WORKER_MAGIC_1"
-        elif self.state == "receive_client_version":
-            client_version, = self._unpack("L")
-            ret = f"client_version:{client_version:#0x} "
-            should_set_affinity, = self._unpack("L")
-            if should_set_affinity:
-                cpu_affinity, = self._unpack("L")
-                ret += f"should_set_affinity:{should_set_affinity} cpu_affinity:{cpu_affinity} "
-            else:
-                ret += f"should_set_affinity:{should_set_affinity} "
-            reserve_space, = self._unpack("L")
-            ret += f"reserve_space:{reserve_space}"
-            self.state = "running"
-            return ret
-        elif self.state == "running":
-            rest = self._unpack_rest()
-            parsed = parse_with(operation, rest)
-            self.offset -= len(parsed.rest)
-            if "value" not in parsed:
-                eprint("working on", wop_enum.parse(self._rest()[:8]))
-                return None
-            val = parsed.value
-            self.impl.wop_called(val.type)
-            return val
-        raise Exception("unknown server state", self.state, "bytes", self.buf[self.offset:])
+def wrap_old_client_for_new_server(client):
+    class WrappedClient:
+        def __init__(self, ack):
+            eprint("[new] > ack", ack)
+
+        async def call(self, op, request):
+            eprint("[new] >", op, request)
+            client.call_wop(op)
+    return WrappedClient
+
+async def dummy_write(data):
+    eprint("wrote out", data)
 
 def main():
     client = Client()
-    server = Server(impl=DissectorAdaptor(client))
+
+    stdin_channel = Channel()
+    servobj = AsyncServer(wrap_old_client_for_new_server(client), stdin_channel.recv, dummy_write)
+    start(servobj.run())
     
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     
@@ -553,14 +563,7 @@ def main():
                     sel.unregister(sys.stdin.buffer)
                     sock.shutdown(socket.SHUT_WR)
                     continue
-                ret = server.feed_data_from_client(data)
-                if ret is not None:
-                    eprint(">", ret)
-                while len(server.buf) > server.offset:
-                    ret = server.feed_data_from_client(bytes())
-                    if ret is None:
-                        break
-                    eprint(">", ret)
+                stdin_channel.send(data)
                 sent = sock.send(data)
                 if sent != len(data):
                     raise Exception("partial send from stdin to sock")
