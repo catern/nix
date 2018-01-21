@@ -290,9 +290,12 @@ server_hello_ack = Struct(
 )
 client_ack = Struct(
     "client_version"/Int64ul,
-    "should_set_affinity"/Int64ul,
-    "cpu_affinity"/construct.If(construct.this.should_set_affinity == 1, Int64ul),
-    "reserve_space"/Int64ul,
+    # determines whether the next field is present or not
+    # TODO figure out how to parse/build when this is 0
+    Const(Int64ul, 1),
+    "cpu_affinity"/ Int64ul,
+    # obsolete, only on server >= 11
+    Const(Int64ul, 0),
 )
 
 class Callcc:
@@ -402,25 +405,25 @@ class ConnectedClient:
         # future when it is done.
         result = Future()
         async def iter_stderr():
-            yield from self._iter_stderr()
+            async for val in self._iter_stderr():
+                yield val
             result.set(await self.read_con(op_response[op]))
         return iter_stderr(), result.get
 
-def nix_client(read_con, write_con):
-    async def hello():
-        await write_con(client_hello, None)
-        server_ack = await read_con(server_hello_ack)
-        server_version = server_ack['server_version']
-        async def connect_with(client_ack_data):
-            await write_con(client_ack, client_ack_data)
-            self = ConnectedClient(read_con, write_con, server_version, client_ack_data)
-            result = Future()
-            async def iter_stderr():
-                yield from self._iter_stderr()
-                result.set(self)
-            return iter_stderr(), result.get
-        return connect_with, server_version
-    return hello
+async def nix_client(read_con, write_con):
+    await write_con(client_hello, None)
+    server_ack = await read_con(server_hello_ack)
+    server_version = server_ack['server_version']
+    async def connect_with(client_ack_data):
+        await write_con(client_ack, client_ack_data)
+        self = ConnectedClient(read_con, write_con, server_version, client_ack_data)
+        result = Future()
+        async def iter_stderr():
+            async for val in self._iter_stderr():
+                yield val
+            result.set(self)
+        return iter_stderr(), result.get
+    return connect_with, server_version
 
 async def nix_server(impl_start, read_con, write_con):
     async def write_out_stderr(iter_stderr):
@@ -460,41 +463,37 @@ class PrintingConnectedClient:
             return result
         return printing_iter_stderr(), printing_get_result
 
-def printing_nix_client(read, write):
-    hello = nix_client(read, write)
-    async def printing_hello():
-        connect_with, server_version = await hello()
-        eprint(f"< server connection response, version:{server_version:#0x}")
-        async def printing_connect_with(ack):
-            eprint(f"> client connection response, version:{ack['client_version']:#0x}, ", ack)
-            iter_stderr, get_client = await connect_with(ack)
-            async def printing_iter_stderr():
-                async for typ, msg in iter_stderr:
-                    eprint("<", typ, msg)
-                    yield typ, msg
-            def get_printing_client():
-                return PrintingConnectedClient(get_client())
-            return printing_iter_stderr(), get_printing_client
-        return printing_connect_with, server_version
-    return printing_hello
+async def printing_nix_client(read, write):
+    connect_with, server_version = await nix_client(read, write)
+    eprint(f"< server connection response, version:{server_version:#0x}")
+    async def printing_connect_with(ack):
+        eprint(f"> client connection response, version:{ack['client_version']:#0x}, ", ack)
+        iter_stderr, get_client = await connect_with(ack)
+        async def printing_iter_stderr():
+            async for typ, msg in iter_stderr:
+                eprint("<", typ, msg)
+                yield typ, msg
+        return printing_iter_stderr(), lambda: PrintingConnectedClient(get_client())
+    return printing_connect_with, server_version
 
 async def dummy_write(data):
     pass
 
-def fd_reader(fd):
+def fd_reader(obj):
     async def read():
-        buf = os.read(fd, 4096)
+        buf = os.read(obj.fileno(), 4096)
         if len(buf) == 0:
-            raise Exception(f"got eof on {fd}")
+            raise Exception(f"got eof on {obj.fileno()}")
         else:
             return buf
     return read
 
-def fd_writer(fd):
+def fd_writer(obj):
     async def write(data):
-        sent = os.write(fd, data)
+        # eprint("about to write to", obj.fileno())
+        sent = os.write(obj.fileno(), data)
         if sent != len(data):
-            raise Exception(f"partial write to {fd}")
+            raise Exception(f"partial write to {obj.fileno()}")
     return write
 
 def con_reader(read):
@@ -521,13 +520,72 @@ def tag_as(s, f):
     # return wrapped
     return f
 
-def just_dissect(sock):
+async def make_nix_client():
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server_address = "/nix/var/nix/daemon-socket/socket"
+    sock.connect(server_address)
+    sock_in = tag_as("sock in", con_reader(fd_reader(sock)))
+    sock_out = tag_as("sock out", con_writer(fd_writer(sock)))
+    return (await printing_nix_client(sock_in, sock_out))
+    # return (await nix_client(sock_in, sock_out))
+
+def do_things():
+    async def things():
+        client_hello, server_version = await make_nix_client()
+        client_init_stderr, get_client = await client_hello({
+            "client_version": 276,
+            # TODO we should be able to just omit this...
+            "cpu_affinity": 4,
+        })
+        async for typ, msg in client_init_stderr:
+            eprint(typ, msg)
+        client = get_client()
+        async def perform_call(op, request):
+            stderr, get_response = await client.call(op, request)
+            async for typ, msg in stderr:
+                eprint(typ, msg)
+            return get_response()
+        response = await perform_call(
+            "wopAddToStore", {
+                "baseName": "neato",
+                "fixed": 0,
+                "recursive": 1,
+                "hashType": "sha256",
+                "nar": {
+                    "type": b"regular",
+                    "contents": b"amazing I did it",
+                },
+        })
+    start(things())
+
+def fully_proxy():
+    start(nix_server(
+        make_nix_client,
+        tag_as("stdin", con_reader(fd_reader(sys.stdin))),
+        tag_as("stdout", con_writer(fd_writer(sys.stdout)))
+    ))
+    eprint("DONE\n")
+
+# TODO
+# handle protocol versioning
+# proper on-stack event loop
+# proxying with actual functionality
+# extract deps into another file
+def just_dissect():
+    server_address = "/nix/var/nix/daemon-socket/socket"
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.connect(server_address)
+
     stdin_channel = Channel()
     sock_channel = Channel()
+    async def make_nix_client():
+        sock_in = tag_as("sock in", con_reader(sock_channel.recv))
+        sock_out = tag_as("sock out", con_writer(dummy_write))
+        return (await printing_nix_client(sock_in, sock_out))
+        # return (await nix_client(sock_in, sock_out))
+
     start(nix_server(
-        printing_nix_client(
-            tag_as("sock in", con_reader(sock_channel.recv)),
-            tag_as("sock out", con_writer(dummy_write))),
+        make_nix_client,
         tag_as("stdin", con_reader(stdin_channel.recv)),
         tag_as("stdout", con_writer(dummy_write))
     ))
@@ -564,23 +622,10 @@ def just_dissect(sock):
                     raise Exception("partial send from stdin to sock")
     eprint("DONE\n")
 
-def fully_proxy(sock):
-    start(nix_server(
-        printing_nix_client(
-            tag_as("sock in", con_reader(fd_reader(sock.fileno()))),
-            tag_as("sock out", con_writer(fd_writer(sock.fileno())))),
-        tag_as("stdin", con_reader(fd_reader(sys.stdin.fileno()))),
-        tag_as("stdout", con_writer(fd_writer(sys.stdout.fileno())))
-    ))
-    eprint("DONE\n")
-
 def main():
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    server_address = "/nix/var/nix/daemon-socket/socket"
-    sock.connect(server_address)
-
-    # return just_dissect(sock)
-    return fully_proxy(sock)
+    # return just_dissect()
+    # return fully_proxy()
+    return do_things()
 
 if __name__ == '__main__':
     main()
