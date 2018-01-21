@@ -56,7 +56,7 @@ wop_to_num = {
     "wopQueryMissing": 40,
 }
 nixstr = construct.Aligned(8, construct.PascalString(construct.Int64ul, encoding="utf8"))
-wop_enum = construct.Enum(Int64ul, **wop_to_num)
+op_enum = construct.Enum(Int64ul, **wop_to_num)
 wopSetOptions = Struct(
     "keepFailed" / Int64ul,
     "keepGoing" / Int64ul,
@@ -368,7 +368,8 @@ class ConnectedClient:
         self.client_configuration = client_configuration
 
     async def call(self, op, request):
-        await self.write_con(op_request[op])
+        await self.write_con(op_enum, op)
+        await self.write_con(op_request[op], request)
         done_with_stderr = False
         iterating = False
         # sadly async generators are not permitted to return values using StopIteration.
@@ -391,58 +392,32 @@ class ConnectedClient:
             return (await self.read_con(op_response[op]))
         return iter_stderr, get_result
 
-def nix_client(read, write):
+def nix_client(read_con, write_con):
     async def hello():
-        reader = DataPoller(read)
-        async def read_con(con):
-            while True:
-                value, consumed = parse_with_con(con, reader.available())
-                if value is not None:
-                    reader.consume(consumed)
-                    return value
-                await reader.wait_for_more()
-        async def write_con(con):
-            return
-        await write_con(client_hello)
+        await write_con(client_hello, None)
         server_ack = await read_con(server_hello_ack)
         server_version = server_ack['server_version']
         async def connect_with(client_ack_data):
-            await write_con(client_ack)
+            await write_con(client_ack, client_ack_data)
             return ConnectedClient(read_con, write_con, server_version, client_ack_data)
         return connect_with, server_version
     return hello
 
-class AsyncServer:
-    def __init__(self, impl_start, read, write):
-        self._impl_start = impl_start
-        # I suppose this will throw on EOF?
-        self._read = read
-        self._write = write
-
-    async def run(self):
-        self.reader = DataPoller(self._read)
-        async def read_con(con):
-            while True:
-                value, consumed = parse_with_con(con, self.reader.available())
-                if value is not None:
-                    self.reader.consume(consumed)
-                    return value
-                await self.reader.wait_for_more()
-        async def write_con(con):
-            return
-        await read_con(client_hello)
-        impl_hello, server_version = await self._impl_start()
-        await write_con(server_hello_ack)
-        ack = await read_con(client_ack)
-        impl = await impl_hello(ack)
-        while True:
-            op = await read_con(wop_enum)
-            request = await read_con(op_request[op])
-            iter_stderr, get_response = await impl.call(op, request)
-            async for typ, msg in iter_stderr():
-                await write_con(type_to_stderr_packet[typ])
-            response = await get_response()
-            await write_con(op_response[op])
+async def nix_server(impl_start, read_con, write_con):
+    await read_con(client_hello)
+    impl_hello, server_version = await impl_start()
+    await write_con(server_hello_ack, {"server_version":server_version})
+    ack = await read_con(client_ack)
+    impl = await impl_hello(ack)
+    while True:
+        op = await read_con(op_enum)
+        request = await read_con(op_request[op])
+        iter_stderr, get_response = await impl.call(op, request)
+        async for typ, msg in iter_stderr():
+            await write_con(stderr_enum, typ)
+            await write_con(type_to_stderr_packet[typ], msg)
+        response = await get_response()
+        await write_con(op_response[op], response)
 
 class PrintingConnectedClient:
     def __init__(self, client):
@@ -476,25 +451,48 @@ def printing_nix_client(read, write):
     return hello
 
 async def dummy_write(data):
-    eprint("wrote out", data)
+    pass
 
-def async_fd_blocking_reader(fd):
+def fd_reader(fd):
     async def read():
         return os.read(fd, 4096)
     return read
 
+def fd_writer(fd):
+    async def write():
+        return os.write(fd, 4096)
+    return write
+
+def con_reader(read):
+    reader = DataPoller(read)
+    async def read_con(con):
+        while True:
+            value, consumed = parse_with_con(con, reader.available())
+            if value is not None:
+                reader.consume(consumed)
+                return value
+            await reader.wait_for_more()
+    return read_con
+
+def con_writer(write):
+    async def write_con(con, data):
+        await write(data)
+    return write_con
+
 def main():
-    stdin_channel = Channel()
-    stdout_channel = Channel()
-    servobj = AsyncServer(printing_nix_client(stdout_channel.recv, dummy_write),
-                          stdin_channel.recv, dummy_write)
-    start(servobj.run())
-    
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     
     server_address = "/nix/var/nix/daemon-socket/socket"
     sock.connect(server_address)
     
+    stdin_channel = Channel()
+    stdout_channel = Channel()
+    start(nix_server(
+        printing_nix_client(
+            con_reader(stdout_channel.recv), con_writer(dummy_write)),
+        con_reader(stdin_channel.recv), con_writer(dummy_write)
+    ))
+
     sel = selectors.DefaultSelector()
     
     sel.register(sock, selectors.EVENT_READ)
