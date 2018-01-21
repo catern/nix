@@ -368,18 +368,28 @@ class ConnectedClient:
         self.client_configuration = client_configuration
 
     async def call(self, op, request):
-        write_con = self.write_con
-        read_con = self.read_con
-        await write_con(op_request[op])
-        # TODO need to handle streaming this out in a sane way rather than just printing it
-        while True:
-            stderr_packet_type = await read_con(stderr_enum)
-            if stderr_packet_type == "STDERR_LAST":
-                break
-            stderr_packet = await read_con(type_to_stderr_packet[stderr_packet_type])
-            eprint("[new] <", stderr_packet_type, stderr_packet)
-        response = await read_con(op_response[op])
-        return response
+        await self.write_con(op_request[op])
+        done_with_stderr = False
+        iterating = False
+        # sadly async generators are not permitted to return values using StopIteration.
+        # "SyntaxError: 'return' with value in async generator"
+        # so we have to split this into two functions and return them both :(
+        async def iter_stderr():
+            "Iterate over stderr messages sent by the server while it processes this request."
+            while True:
+                stderr_packet_type = await self.read_con(stderr_enum)
+                if stderr_packet_type == "STDERR_LAST":
+                    break
+                stderr_packet = await self.read_con(type_to_stderr_packet[stderr_packet_type])
+                yield stderr_packet_type, stderr_packet
+            nonlocal done_with_stderr
+            done_with_stderr = True
+        async def get_result():
+            "Get the result of the request; should be called after iterating over the stderr messages"
+            if not done_with_stderr:
+                raise RuntimeError("can't get result until you finish iterating over stderr output")
+            return (await self.read_con(op_response[op]))
+        return iter_stderr, get_result
 
 def nix_client(read, write):
     async def hello():
@@ -428,8 +438,10 @@ class AsyncServer:
         while True:
             op = await read_con(wop_enum)
             request = await read_con(op_request[op])
-            # TODO need to pull stderr out of impl.call
-            response = await impl.call(op, request)
+            iter_stderr, get_response = await impl.call(op, request)
+            async for typ, msg in iter_stderr():
+                await write_con(type_to_stderr_packet[typ])
+            response = await get_response()
             await write_con(op_response[op])
 
 class PrintingConnectedClient:
@@ -438,8 +450,16 @@ class PrintingConnectedClient:
 
     async def call(self, op, request):
         eprint(">", op, request)
-        response = await self.client.call(op, request)
-        eprint("<", response)
+        real_iter_stderr, real_get_result = await self.client.call(op, request)
+        async def iter_stderr():
+            async for typ, msg in real_iter_stderr():
+                eprint("<", typ, msg)
+                yield typ, msg
+        async def get_result():
+            response = await real_get_result()
+            eprint("<", response)
+            return response
+        return iter_stderr, get_result
 
 def printing_nix_client(read, write):
     real_hello = nix_client(read, write)
