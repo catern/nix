@@ -106,10 +106,10 @@ wopCollectGarbage = Struct(
     "pathsToDelete" / construct.PrefixedArray(Int64ul, nixstr),
     "ignoreLiveness" / Int64ul,
     "maxFreed" / Int64ul,
-    # obselete fields
-    Int64ul,
-    Int64ul,
-    Int64ul
+    # obsolete fields
+    construct.Const(Int64ul, 0),
+    construct.Const(Int64ul, 0),
+    construct.Const(Int64ul, 0)
 )
 op_request = {
     "wopSetOptions":wopSetOptions,
@@ -164,7 +164,7 @@ wopCollectGarbage_response = Struct(
     "collectedPaths" / construct.PrefixedArray(Int64ul, nixstr),
     "bytesFreed"/Int64ul,
     # obsolete
-    Int64ul,
+    construct.Const(Int64ul, 0),
 )
 substitutable_pathinfo = Struct(
     "path"/nixstr,
@@ -348,6 +348,22 @@ class DataPoller:
     def consume(self, n):
         self.buf = self.buf[n:]
 
+class Future:
+    def __init__(self):
+        self.value = None
+        self.been_set = False
+
+    def set(self, value):
+        if self.been_set:
+            raise Exception("can't set future twice")
+        self.value = value
+        self.been_set = True
+
+    def get(self):
+        if not self.been_set:
+            raise Exception("can't get value of unset future")
+        return self.value
+
 def parse_with_con(con, bytes):
     parsed = construct.Optional(Struct(
         "offset1"/construct.Tell,
@@ -367,30 +383,28 @@ class ConnectedClient:
         self.server_version = server_version
         self.client_configuration = client_configuration
 
+    async def _iter_stderr(self):
+        "Iterate over stderr messages sent by the server while it processes some request."
+        while True:
+            stderr_packet_type = await self.read_con(stderr_enum)
+            if stderr_packet_type == "STDERR_LAST":
+                break
+            stderr_packet = await self.read_con(type_to_stderr_packet[stderr_packet_type])
+            yield stderr_packet_type, stderr_packet
+
     async def call(self, op, request):
         await self.write_con(op_enum, op)
         await self.write_con(op_request[op], request)
-        done_with_stderr = False
-        iterating = False
-        # sadly async generators are not permitted to return values using StopIteration.
-        # "SyntaxError: 'return' with value in async generator"
-        # so we have to split this into two functions and return them both :(
+        # We can't (yet) return a value directly from an async generator.
+        # We can use a future to bridge this gap: we return a tuple
+        # containing the async generator as well as the getter from a
+        # future; the async generator will put its return value in the
+        # future when it is done.
+        result = Future()
         async def iter_stderr():
-            "Iterate over stderr messages sent by the server while it processes this request."
-            while True:
-                stderr_packet_type = await self.read_con(stderr_enum)
-                if stderr_packet_type == "STDERR_LAST":
-                    break
-                stderr_packet = await self.read_con(type_to_stderr_packet[stderr_packet_type])
-                yield stderr_packet_type, stderr_packet
-            nonlocal done_with_stderr
-            done_with_stderr = True
-        async def get_result():
-            "Get the result of the request; should be called after iterating over the stderr messages"
-            if not done_with_stderr:
-                raise RuntimeError("can't get result until you finish iterating over stderr output")
-            return (await self.read_con(op_response[op]))
-        return iter_stderr, get_result
+            yield from self._iter_stderr()
+            result.set(await self.read_con(op_response[op]))
+        return iter_stderr(), result.get
 
 def nix_client(read_con, write_con):
     async def hello():
@@ -399,24 +413,34 @@ def nix_client(read_con, write_con):
         server_version = server_ack['server_version']
         async def connect_with(client_ack_data):
             await write_con(client_ack, client_ack_data)
-            return ConnectedClient(read_con, write_con, server_version, client_ack_data)
+            self = ConnectedClient(read_con, write_con, server_version, client_ack_data)
+            result = Future()
+            async def iter_stderr():
+                yield from self._iter_stderr()
+                result.set(self)
+            return iter_stderr(), result.get
         return connect_with, server_version
     return hello
 
 async def nix_server(impl_start, read_con, write_con):
+    async def write_out_stderr(iter_stderr):
+        async for typ, msg in iter_stderr:
+            await write_con(stderr_enum, typ)
+            await write_con(type_to_stderr_packet[typ], msg)
+        await write_con(stderr_enum, "STDERR_LAST")
     await read_con(client_hello)
     impl_hello, server_version = await impl_start()
     await write_con(server_hello_ack, {"server_version":server_version})
     ack = await read_con(client_ack)
-    impl = await impl_hello(ack)
+    iter_stderr, get_impl = await impl_hello(ack)
+    await write_out_stderr(iter_stderr)
+    impl = get_impl()
     while True:
         op = await read_con(op_enum)
         request = await read_con(op_request[op])
         iter_stderr, get_response = await impl.call(op, request)
-        async for typ, msg in iter_stderr():
-            await write_con(stderr_enum, typ)
-            await write_con(type_to_stderr_packet[typ], msg)
-        response = await get_response()
+        await write_out_stderr(iter_stderr)
+        response = get_response()
         await write_con(op_response[op], response)
 
 class PrintingConnectedClient:
@@ -425,42 +449,52 @@ class PrintingConnectedClient:
 
     async def call(self, op, request):
         eprint(">", op, request)
-        real_iter_stderr, real_get_result = await self.client.call(op, request)
-        async def iter_stderr():
-            async for typ, msg in real_iter_stderr():
+        iter_stderr, get_result = await self.client.call(op, request)
+        async def printing_iter_stderr():
+            async for typ, msg in iter_stderr:
                 eprint("<", typ, msg)
                 yield typ, msg
-        async def get_result():
-            response = await real_get_result()
-            eprint("<", response)
-            return response
-        return iter_stderr, get_result
+        def printing_get_result():
+            result = get_result()
+            eprint("<", result)
+            return result
+        return printing_iter_stderr(), printing_get_result
 
 def printing_nix_client(read, write):
-    real_hello = nix_client(read, write)
-    async def hello():
-        real_connect_with, server_version = await real_hello()
+    hello = nix_client(read, write)
+    async def printing_hello():
+        connect_with, server_version = await hello()
         eprint(f"< server connection response, version:{server_version:#0x}")
-        async def connect_with(ack):
-            client_version = ack['client_version']
-            del ack['client_version']
-            eprint(f"> client connection response, version:{client_version:#0x}, ", ack)
-            real_client = await real_connect_with(ack)
-            return PrintingConnectedClient(real_client)
-        return connect_with, server_version
-    return hello
+        async def printing_connect_with(ack):
+            eprint(f"> client connection response, version:{ack['client_version']:#0x}, ", ack)
+            iter_stderr, get_client = await connect_with(ack)
+            async def printing_iter_stderr():
+                async for typ, msg in iter_stderr:
+                    eprint("<", typ, msg)
+                    yield typ, msg
+            def get_printing_client():
+                return PrintingConnectedClient(get_client())
+            return printing_iter_stderr(), get_printing_client
+        return printing_connect_with, server_version
+    return printing_hello
 
 async def dummy_write(data):
     pass
 
 def fd_reader(fd):
     async def read():
-        return os.read(fd, 4096)
+        buf = os.read(fd, 4096)
+        if len(buf) == 0:
+            raise Exception(f"got eof on {fd}")
+        else:
+            return buf
     return read
 
 def fd_writer(fd):
-    async def write():
-        return os.write(fd, 4096)
+    async def write(data):
+        sent = os.write(fd, data)
+        if sent != len(data):
+            raise Exception(f"partial write to {fd}")
     return write
 
 def con_reader(read):
@@ -476,21 +510,26 @@ def con_reader(read):
 
 def con_writer(write):
     async def write_con(con, data):
-        await write(data)
+        built = con.build(data)
+        await write(built)
     return write_con
 
-def main():
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    
-    server_address = "/nix/var/nix/daemon-socket/socket"
-    sock.connect(server_address)
-    
+def tag_as(s, f):
+    def wrapped(*args, **kwargs):
+        eprint(s, args)
+        return f(*args, **kwargs)
+    # return wrapped
+    return f
+
+def just_dissect(sock):
     stdin_channel = Channel()
-    stdout_channel = Channel()
+    sock_channel = Channel()
     start(nix_server(
         printing_nix_client(
-            con_reader(stdout_channel.recv), con_writer(dummy_write)),
-        con_reader(stdin_channel.recv), con_writer(dummy_write)
+            tag_as("sock in", con_reader(sock_channel.recv)),
+            tag_as("sock out", con_writer(dummy_write))),
+        tag_as("stdin", con_reader(stdin_channel.recv)),
+        tag_as("stdout", con_writer(dummy_write))
     ))
 
     sel = selectors.DefaultSelector()
@@ -508,7 +547,7 @@ def main():
                     sel.unregister(sock)
                     sys.stdout.close()
                     continue
-                stdout_channel.send(data)
+                sock_channel.send(data)
                 sent = os.write(sys.stdout.buffer.fileno(), data)
                 if sent != len(data):
                     raise Exception("partial send from sock to stdout")
@@ -523,6 +562,25 @@ def main():
                 sent = sock.send(data)
                 if sent != len(data):
                     raise Exception("partial send from stdin to sock")
-    eprint("DONE")
+    eprint("DONE\n")
+
+def fully_proxy(sock):
+    start(nix_server(
+        printing_nix_client(
+            tag_as("sock in", con_reader(fd_reader(sock.fileno()))),
+            tag_as("sock out", con_writer(fd_writer(sock.fileno())))),
+        tag_as("stdin", con_reader(fd_reader(sys.stdin.fileno()))),
+        tag_as("stdout", con_writer(fd_writer(sys.stdout.fileno())))
+    ))
+    eprint("DONE\n")
+
+def main():
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server_address = "/nix/var/nix/daemon-socket/socket"
+    sock.connect(server_address)
+
+    # return just_dissect(sock)
+    return fully_proxy(sock)
+
 if __name__ == '__main__':
     main()
