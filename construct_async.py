@@ -1,16 +1,21 @@
 import construct
 
 def parse_with_con(con, bytes):
-    parsed = construct.Optional(construct.Struct(
+    fullcon = construct.Struct(
         "offset1"/construct.Tell,
         "value"/con,
         "offset2"/construct.Tell
-    )).parse(bytes)
-    if parsed is not None:
-        size = parsed["offset2"] - parsed["offset1"]
-        return parsed["value"], size
-    else:
+    )
+    try:
+        parsed = fullcon.parse(bytes)
+    # I *think* this corresponds exactly and only to errors where we
+    # don't have enough bytes, but I'm not sure. Catching all
+    # exceptions makes debugging parse errors nearly impossible, so I
+    # don't really have an alternative.
+    except construct.core.FieldError:
         return None, 0
+    size = parsed["offset2"] - parsed["offset1"]
+    return parsed["value"], size
 
 class DataPoller:
     def __init__(self, read):

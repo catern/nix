@@ -7,65 +7,11 @@ import selectors
 import struct
 import worker_protocol
 from construct_async import con_reader, con_writer
+from async import fd_reader, fd_writer, Channel, LinearVariable, start
 
 def eprint(*args, **kwargs):
     kwargs['file'] = sys.stderr
     print(*args, **kwargs)
-
-class Callcc:
-    def __init__(self, func):
-        self.func = func
-
-    @staticmethod
-    def yield_up(value):
-        return (yield value)
-
-    def __await__(self):
-        return self.yield_up(self.func)
-
-def callcc(func):
-    return Callcc(func)
-
-def start(coroutine):
-    def trampoline(value):
-        try:
-            f = coroutine.send(value)
-        except StopIteration:
-            return
-        f(trampoline)
-    trampoline(None)
-
-class Channel:
-    def __init__(self):
-        self.cbs = []
-
-    def send(self, value):
-        cbs = self.cbs
-        self.cbs = []
-        for cb in cbs:
-            cb(value)
-
-    def register_callback(self, cb):
-        self.cbs.append(cb)
-
-    async def recv(self):
-        return (await callcc(self.register_callback))
-
-class Future:
-    def __init__(self):
-        self.value = None
-        self.been_set = False
-
-    def set(self, value):
-        if self.been_set:
-            raise Exception("can't set future twice")
-        self.value = value
-        self.been_set = True
-
-    def get(self):
-        if not self.been_set:
-            raise Exception("can't get value of unset future")
-        return self.value
 
 class ConnectedClient:
     def __init__(self, read_con, write_con, protocol, server_version, client_version, initial_options):
@@ -93,7 +39,7 @@ class ConnectedClient:
         # containing the async generator as well as the getter from a
         # future; the async generator will put its return value in the
         # future when it is done.
-        result = Future()
+        result = LinearVariable()
         async def iter_stderr():
             async for val in self._iter_stderr():
                 yield val
@@ -108,7 +54,7 @@ async def nix_client(read_con, write_con):
         proto = worker_protocol.get_constructors_for_version(server_version, client_version)
         await write_con(proto.client_initial_options, initial_options)
         self = ConnectedClient(read_con, write_con, proto, server_version, client_version, initial_options)
-        result = Future()
+        result = LinearVariable()
         async def iter_stderr():
             async for val in self._iter_stderr():
                 yield val
@@ -169,26 +115,6 @@ async def printing_nix_client(read, write):
         return printing_iter_stderr(), lambda: PrintingConnectedClient(get_client())
     return printing_connect_with, server_version
 
-async def dummy_write(data):
-    pass
-
-def fd_reader(obj):
-    async def read():
-        buf = os.read(obj.fileno(), 4096)
-        if len(buf) == 0:
-            raise Exception(f"got eof on {obj.fileno()}")
-        else:
-            return buf
-    return read
-
-def fd_writer(obj):
-    async def write(data):
-        # eprint("about to write to", obj.fileno())
-        sent = os.write(obj.fileno(), data)
-        if sent != len(data):
-            raise Exception(f"partial write to {obj.fileno()}")
-    return write
-
 def tag_as(s, f):
     def wrapped(*args, **kwargs):
         eprint(s, args)
@@ -243,10 +169,15 @@ def fully_proxy():
     eprint("DONE\n")
 
 # TODO
-# handle protocol versioning
+# reimplement script using this "library"
 # proper on-stack event loop
 # proxying with actual functionality
 # extract deps into another file
+
+# check if there's a way to get a "Not enough bytes" exception from
+# construct; otherwise with my current model, I'll just block forever
+# when I mis-parse something, since I interpret all exceptions as "Not
+# enough bytes"
 def just_dissect():
     server_address = "/nix/var/nix/daemon-socket/socket"
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -254,6 +185,7 @@ def just_dissect():
 
     stdin_channel = Channel()
     sock_channel = Channel()
+    async def dummy_write(data): pass
     async def make_nix_client():
         sock_in = tag_as("sock in", con_reader(sock_channel.recv))
         sock_out = tag_as("sock out", con_writer(dummy_write))
@@ -299,8 +231,8 @@ def just_dissect():
     eprint("DONE\n")
 
 def main():
-    # return just_dissect()
-    return fully_proxy()
+    return just_dissect()
+    # return fully_proxy()
     # return do_things()
 
 if __name__ == '__main__':

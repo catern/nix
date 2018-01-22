@@ -8,14 +8,11 @@ nixstr = construct.Aligned(8, construct.PascalString(construct.Int64ul, encoding
 nixstr_array = construct.PrefixedArray(Int64ul, nixstr)
 
 #### version-independent connection initialization messages
-WORKER_MAGIC_1 = 0x6e697863
-WORKER_MAGIC_2 = 0x6478696f
-
-client_hello = Const(Int64ul, WORKER_MAGIC_1)
+client_hello = Const(b"cxin\0\0\0\0")
 server_hello_version = construct.FocusedSeq(
-    "server_version",
-    Const(Int64ul, WORKER_MAGIC_2),
-    "server_version"/Int64ul
+    1,
+    Const(b"oixd\0\0\0\0"),
+    Int64ul
 )
 client_version = Int64ul
 
