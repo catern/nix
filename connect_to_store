@@ -25,6 +25,8 @@ class ConnectedClient:
     async def _iter_stderr(self):
         "Iterate over stderr messages sent by the server while it processes some request."
         while True:
+            # TODO STDERR_ERROR needs to result in an error going back to the user, with no result.
+            # perhaps an exception?
             stderr_type = await self.read_con(self.proto.stderr_type)
             if stderr_type == "STDERR_LAST":
                 break
@@ -79,6 +81,7 @@ async def nix_server(impl_start, read_con, write_con):
     impl = get_impl()
     while True:
         op = await read_con(proto.op_type)
+        eprint("parsing", op)
         request = await read_con(proto.op_request[op])
         iter_stderr, get_response = await impl.call(op, request)
         await write_out_stderr(iter_stderr)
@@ -231,8 +234,8 @@ def just_dissect():
     eprint("DONE\n")
 
 def main():
-    return just_dissect()
-    # return fully_proxy()
+    # return just_dissect()
+    return fully_proxy()
     # return do_things()
 
 if __name__ == '__main__':

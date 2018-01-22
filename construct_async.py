@@ -1,4 +1,5 @@
 import construct
+import sys
 
 def parse_with_con(con, bytes):
     fullcon = construct.Struct(
@@ -14,6 +15,13 @@ def parse_with_con(con, bytes):
     # don't really have an alternative.
     except construct.core.FieldError:
         return None, 0
+    except construct.core.RangeError:
+        return None, 0
+    except:
+        print(bytes[:400], len(bytes), file=sys.stderr)
+        # with open("bytes_when_failed", 'wb') as f:
+        #     f.write(bytes)
+        raise
     size = parsed["offset2"] - parsed["offset1"]
     return parsed["value"], size
 
