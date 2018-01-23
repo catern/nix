@@ -131,6 +131,20 @@ def operations(server_version, client_version):
         construct.Const(Int64ul, 0),
         construct.Const(Int64ul, 0)
     )
+    wopAddToStoreNar = Struct(
+        "path" / nixstr,
+        "deriver" / nixstr,
+        "narHash" / nixstr,
+        "references" / nixstr_array,
+        "registrationTime"/Int64ul,
+        "narSize" / Int64ul,
+        "ultimate"/Int64ul,
+        "sigs" / nixstr_array,
+        "ca"/nixstr,
+        "repair" / Int64ul,
+        "noCheckSigs" / Int64ul,
+        "nar" / nar.dump
+    )
     type_to_op_request = {
         "wopFindRoots"  : Struct(),
         "wopSyncWithGC" : Struct(),
@@ -141,12 +155,14 @@ def operations(server_version, client_version):
         "wopQueryDerivationOutputs" : Struct("path"/nixstr),
         "wopAddTempRoot"            : Struct("path"/nixstr),
         "wopAddIndirectRoot"        : Struct("path"/nixstr),
+        "wopQueryMissing"           : Struct("targets"/nixstr_array),
         "wopSetOptions":wopSetOptions,
         "wopAddToStore":wopAddToStore,
         "wopAddTextToStore":wopAddTextToStore,
         "wopBuildPaths":wopBuildPaths,
         "wopQuerySubstitutablePathInfos":wopQuerySubstitutablePathInfos,
         "wopCollectGarbage":wopCollectGarbage,
+        "wopAddToStoreNar":wopAddToStoreNar,
     }
     
     #### operation responses
@@ -158,17 +174,15 @@ def operations(server_version, client_version):
         "entries" / construct.PrefixedArray(Int64ul, map_entry)
     )
     pathinfo_response = Struct(
-        # daemon version 17 and above
-        # "valid" / Int64ul,
+        "valid" / Int64ul,
         "deriver"/nixstr,
         "narHash"/nixstr,
         "references" / nixstr_array,
         "registrationTime"/Int64ul,
         "narSize"/Int64ul,
-        # daemon version 16 and above
-        # "ultimate"/Int64ul,
-        # "sigs" / nixstr_array,
-        # "ca"/nixstr,
+        "ultimate"/Int64ul,
+        "sigs" / nixstr_array,
+        "ca"/nixstr,
     )
     wopCollectGarbage_response = Struct(
         "collectedPaths" / nixstr_array,
@@ -186,8 +200,16 @@ def operations(server_version, client_version):
     wopQuerySubstitutablePathInfos_response = Struct(
         "infos" / construct.PrefixedArray(Int64ul, substitutable_pathinfo)
     )
+    wopQueryMissing_response = Struct(
+        "willBuild" / nixstr_array,
+        "willSubstitute" / nixstr_array,
+        "unknown" / nixstr_array,
+        "downloadSize" / Int64ul,
+        "narSize" / Int64ul
+    )
     type_to_op_response = {
         "wopSetOptions": Struct(),
+        "wopAddToStoreNar": Struct(),
         "wopIsValidPath"     : Struct("ret"/Int64ul),
         "wopEnsurePath"      : Struct("ret"/Int64ul),
         "wopBuildPaths"      : Struct("ret"/Int64ul),
@@ -202,6 +224,7 @@ def operations(server_version, client_version):
         "wopQueryPathInfo": pathinfo_response,
         "wopQuerySubstitutablePathInfos": wopQuerySubstitutablePathInfos_response,
         "wopCollectGarbage": wopCollectGarbage_response,
+        "wopQueryMissing":wopQueryMissing_response,
     }
     return op_type, type_to_op_request, type_to_op_response
 

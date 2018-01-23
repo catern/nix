@@ -7,11 +7,17 @@ import selectors
 import struct
 import worker_protocol
 from construct_async import con_reader, con_writer
-from async import fd_reader, fd_writer, Channel, LinearVariable, start
+from async import fd_reader, fd_writer, Channel, LinearVariable, start, store_generator_return_value, agen_return
 
 def eprint(*args, **kwargs):
     kwargs['file'] = sys.stderr
     print(*args, **kwargs)
+
+class StderrError(Exception):
+    def __init__(self, error, status):
+        super().__init__(error)
+        self.error = error
+        self.status = status
 
 class ConnectedClient:
     def __init__(self, read_con, write_con, protocol, server_version, client_version, initial_options):
@@ -25,43 +31,35 @@ class ConnectedClient:
     async def _iter_stderr(self):
         "Iterate over stderr messages sent by the server while it processes some request."
         while True:
-            # TODO STDERR_ERROR needs to result in an error going back to the user, with no result.
-            # perhaps an exception?
             stderr_type = await self.read_con(self.proto.stderr_type)
             if stderr_type == "STDERR_LAST":
                 break
             stderr_message = await self.read_con(self.proto.stderr_message[stderr_type])
+            if stderr_type == "STDERR_ERROR":
+                raise StderrError(stderr_message['error'], stderr_message['status'])
             yield stderr_type, stderr_message
 
+    @store_generator_return_value
     async def call(self, op, request):
         await self.write_con(self.proto.op_type, op)
         await self.write_con(self.proto.op_request[op], request)
-        # We can't (yet) return a value directly from an async generator.
-        # We can use a future to bridge this gap: we return a tuple
-        # containing the async generator as well as the getter from a
-        # future; the async generator will put its return value in the
-        # future when it is done.
-        result = LinearVariable()
-        async def iter_stderr():
-            async for val in self._iter_stderr():
-                yield val
-            result.set(await self.read_con(self.proto.op_response[op]))
-        return iter_stderr(), result.get
+        async for val in self._iter_stderr():
+            yield val
+        agen_return(await self.read_con(self.proto.op_response[op]))
 
 async def nix_client(read_con, write_con):
     await write_con(worker_protocol.client_hello, None)
     server_version = await read_con(worker_protocol.server_hello_version)
+
+    @store_generator_return_value
     async def connect_with(client_version, initial_options):
         await write_con(worker_protocol.client_version, client_version)
         proto = worker_protocol.get_constructors_for_version(server_version, client_version)
         await write_con(proto.client_initial_options, initial_options)
-        self = ConnectedClient(read_con, write_con, proto, server_version, client_version, initial_options)
-        result = LinearVariable()
-        async def iter_stderr():
-            async for val in self._iter_stderr():
-                yield val
-            result.set(self)
-        return iter_stderr(), result.get
+        client = ConnectedClient(read_con, write_con, proto, server_version, client_version, initial_options)
+        async for val in client._iter_stderr():
+            yield val
+        agen_return(client)
     return connect_with, server_version
 
 async def nix_server(impl_start, read_con, write_con):
@@ -70,52 +68,62 @@ async def nix_server(impl_start, read_con, write_con):
     await write_con(worker_protocol.server_hello_version, server_version)
     client_version = await read_con(worker_protocol.client_version)
     proto = worker_protocol.get_constructors_for_version(server_version, client_version)
-    async def write_out_stderr(iter_stderr):
-        async for typ, msg in iter_stderr:
-            await write_con(proto.stderr_type, typ)
-            await write_con(proto.stderr_message[typ], msg)
+    async def write_out_stderr(stderr_with_value):
+        try:
+            async for typ, msg in stderr_with_value:
+                await write_con(proto.stderr_type, typ)
+                await write_con(proto.stderr_message[typ], msg)
+        except StderrError as e:
+            await write_con(proto.stderr_type, "STDERR_ERROR")
+            await write_con(proto.stderr_message["STDERR_ERROR"], {"error":e.error, "status":e.status})
+            raise
         await write_con(proto.stderr_type, "STDERR_LAST")
+        return stderr_with_value.get()
     initial_options = await read_con(proto.client_initial_options)
-    iter_stderr, get_impl = await impl_hello(client_version, initial_options)
-    await write_out_stderr(iter_stderr)
-    impl = get_impl()
+    impl = await write_out_stderr(impl_hello(client_version, initial_options))
     while True:
         op = await read_con(proto.op_type)
         eprint("parsing", op)
         request = await read_con(proto.op_request[op])
-        iter_stderr, get_response = await impl.call(op, request)
-        await write_out_stderr(iter_stderr)
-        response = get_response()
+        response = await write_out_stderr(impl.call(op, request))
         await write_con(proto.op_response[op], response)
 
 class PrintingConnectedClient:
     def __init__(self, client):
         self.client = client
 
+    @store_generator_return_value
     async def call(self, op, request):
         eprint(">", op, request)
-        iter_stderr, get_result = await self.client.call(op, request)
-        async def printing_iter_stderr():
-            async for typ, msg in iter_stderr:
+        stderr_with_response = self.client.call(op, request)
+        try:
+            async for typ, msg in stderr_with_response:
                 eprint("<", typ, msg)
                 yield typ, msg
-        def printing_get_result():
-            result = get_result()
-            eprint("<", result)
-            return result
-        return printing_iter_stderr(), printing_get_result
+        except StderrError as e:
+            eprint(f"< ERROR({e.status}): {e.error}")
+            raise
+        response = stderr_with_response.get()
+        eprint("<", response)
+        agen_return(response)
 
 async def printing_nix_client(read, write):
     connect_with, server_version = await nix_client(read, write)
     eprint(f"< server connection response, version:{server_version:#0x}")
+
+    @store_generator_return_value
     async def printing_connect_with(client_version, initial_options):
         eprint(f"> client connection response, version:{client_version:#0x}", initial_options)
-        iter_stderr, get_client = await connect_with(client_version, initial_options)
-        async def printing_iter_stderr():
-            async for typ, msg in iter_stderr:
+        stderr_with_client = connect_with(client_version, initial_options)
+        try:
+            async for typ, msg in stderr_with_client:
                 eprint("<", typ, msg)
                 yield typ, msg
-        return printing_iter_stderr(), lambda: PrintingConnectedClient(get_client())
+        except StderrError as e:
+            eprint(f"< LOGIN ERROR({e.status}): {e.error}")
+            raise
+        eprint("== Connection initialized.")
+        agen_return(PrintingConnectedClient(stderr_with_client.get()))
     return printing_connect_with, server_version
 
 def tag_as(s, f):
@@ -134,7 +142,195 @@ async def make_nix_client():
     return (await printing_nix_client(sock_in, sock_out))
     # return (await nix_client(sock_in, sock_out))
 
-def do_things():
+
+from collections import namedtuple
+from pathlib import Path
+
+DerivationOutput = namedtuple('DerivationOutput', ['path', 'hashAlgo', 'hash'])
+
+Derivation = namedtuple('Derivation', ['outputs', 'inputs', 'inputSrcs', 'platform', 'builder', 'args', 'env'])
+
+def build_derivation(outputs, inputs, inputSrcs, platform, builder, args, env):
+    return Derivation(
+        {output[0]:DerivationOutput(Path(output[1]), output[2], output[3]) for output in outputs},
+        {Path(input[0]):input[1] for input in inputs},
+        inputSrcs,
+        platform,
+        builder,
+        args,
+        dict(env)
+    )
+
+def parse_derivation(s):
+    # LOL
+    return eval(s, {'Derive':build_derivation})
+
+import urllib.request
+def fetchurl(url):
+    return urllib.request.urlopen(url).read()
+
+def add_to_store(path, hashType, recursive):
+    if recursive:
+        subprocess.check_call(['nix-store', '--add-fixed', '--recursive', hashType, path])
+    else:
+        subprocess.check_call(['nix-store', '--add-fixed', hashType, path])
+
+class ImpureClient:
+    def __init__(self, client):
+        self.client = client
+
+    async def call(self, op, request):
+        if op == 'wopBuildPaths':
+            return (await self.impure_build_paths(request))
+        else:
+            return (await self.client.call(op, request))
+
+    def with_no_logs(self, retval):
+        return no_logs(), lambda: retval
+
+    async def impure_build_paths(self, request):
+        eprint("Impurely building paths!")
+        # TODO handle building multiple paths
+        if len(request.paths) != 1 or request.mode != 0:
+            return (await self.client.call("wopBuildPaths", request))
+        else:
+            path = Path(request.paths[0])
+            if path.exists():
+                # in an ideal world, this would look like...
+                # return {"ret": 1}
+                # but we have to stack rip...
+                # maybe we should have an interface that looks like..
+                # self, request, return_cb
+                # then we function as an async generator here
+                return empty_agen(), lambda: {"ret": 1}
+
+    async def perform_call(self, op, request):
+        stderr, get_response = await self.client.call(op, request)
+        async for typ, msg in stderr:
+            # currently, the client is already printing it
+            pass
+        return get_response()
+
+    async def add_nar_to_store(self, name, hashType, recursive, nar):
+        return (await self.perform_call(
+            "wopAddToStore", {
+                "baseName": name,
+                "fixed": not (hashType == 'sha256' and recursive),
+                "recursive": recursive,
+                "hashType": hashType,
+                "nar": nar,
+        }))
+
+    async def add_bytes_to_store(self, name, hashType, recursive, bytes):
+        return (await self.add_nar_to_store(name, hashType, recursive, {
+            "type": b"regular",
+            "contents": bytes,
+        }))
+
+    @classmethod
+    async def make(cls):
+        client_hello, server_version = await make_nix_client()
+        client_init_stderr, get_client = await client_hello(0x114, {
+            # TODO we should be able to just omit this...
+            "cpu_affinity": 4,
+        })
+        async for typ, msg in client_init_stderr:
+            eprint(typ, msg)
+        return cls(get_client())
+
+    @classmethod
+    async def make(cls, make=make_nix_client):
+        connect_with, server_version = await make()
+        async def my_connect_with(client_version, initial_options):
+            iter_stderr, get_client = await connect_with(client_version, initial_options)
+            return iter_stderr, lambda: cls(get_client())
+        return my_connect_with, server_version
+
+    async def impure_build(self, drv):
+        "Impurely build this derivation in the current environment and add it to the store."
+        output = drv.outputs['out']
+        if not output.hash:
+            raise Exception("only fixed output derivations can be build impurely")
+        if not len(drv.outputs) == 1:
+            raise Exception("fixed output derivations must only have one output")
+        if not all(input.exists() for input in drv.inputs):
+            raise Exception("all inputs must be valid before building")
+    
+        name = str(output.path).split('-', 1)[1]
+        if ":" in output.hashAlgo:
+            option, hashType = output.hashAlgo.split(':')
+            if option == 'r':
+                recursive = True
+            else:
+                raise Exception("unknown option", option)
+        else:
+            hashType = output.hashAlgo
+            recursive = False
+    
+        if drv.builder == 'builtin:fetchurl':
+            return (await self.add_bytes_to_store(name, hashType, recursive, fetchurl(drv.env['url'])))
+        else:
+            raise Exception("currently only works for builtin:fetchurl")
+
+    async def build_paths(self, drvs):
+        # TODO set up a reactive build graph
+        for drv in drvs:
+            if drv.outputs['out'].hash:
+                await self.impure_build(drv)
+        return 1
+
+def impure_build_nonbuiltin(drv):
+    import tempfile
+    import subprocess
+    import shutil
+    fake_out = Path(tempfile.mkdtemp())
+    workdir = Path(tempfile.mkdtemp())
+
+    env = os.environ.copy()
+    env.update(drv.env)
+    env.update({'NIX_BUILD_TOP': workdir, 'out': fake_out, 'TMPDIR': workdir})
+    cmdline = [drv.builder] + drv.args
+    proc = subprocess.Popen(cmdline, cwd=workdir, env=env)
+    if proc.wait() != 0:
+        raise Exception
+    shutil.rmtree(workdir)
+    return fake_out
+
+def do_things(path):
+    # need to query derivation info.
+    # or maybe I just read it and build it?
+    # yeah that seems right
+
+    # no no
+    # hmm
+    # should I read first?
+    # or check first?
+
+    # I suppose I should wopQueryMissing first, and see which of them is missing.
+
+    # oh wait, in any case I need to read the drv to find out if it's a fixout.
+
+    # okay, so I'll read the drv,
+    with path.open() as f:
+        drv = parse_derivation(f.read())
+    eprint(drv)
+    # check for whether its output exists (by just checking the filesystem lmao)
+    if drv.outputs['out'].path.exists():
+        eprint("already exists")
+        print(drv.outputs['out'].path)
+        # return
+    # build it impurely,
+    eprint("building")
+    async def do_stuff():
+        client = await ImpureClient.make()
+        return (await client.impure_build(drv))
+
+    result = LinearVariable()
+    start(do_stuff(), result.set)
+    eprint("result", result.get())
+    return
+
+    # later i'll handle recursing and building its inputs
     async def things():
         client_hello, server_version = await make_nix_client()
         client_init_stderr, get_client = await client_hello(0x114, {
@@ -234,9 +430,13 @@ def just_dissect():
     eprint("DONE\n")
 
 def main():
-    # return just_dissect()
-    return fully_proxy()
-    # return do_things()
+    import sys
+
+    if len(sys.argv) > 1:
+        return do_things(Path(sys.argv[1]))
+    else:
+        return fully_proxy()
+        # return just_dissect()
 
 if __name__ == '__main__':
     main()
