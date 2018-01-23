@@ -88,13 +88,18 @@ async def nix_server(impl_start, read_con, write_con):
         response = await write_out_stderr(impl.call(op, request))
         await write_con(proto.op_response[op], response)
 
+import reprlib
+import construct
 class PrintingConnectedClient:
     def __init__(self, client):
         self.client = client
 
     @store_generator_return_value
     async def call(self, op, request):
-        eprint(">", op, request)
+        if isinstance(request, construct.lib.container.Container):
+            eprint(">", op, request)
+        else:
+            eprint(">", op, reprlib.repr(request))
         stderr_with_response = self.client.call(op, request)
         try:
             async for typ, msg in stderr_with_response:
@@ -179,37 +184,42 @@ class ImpureClient:
     def __init__(self, client):
         self.client = client
 
-    async def call(self, op, request):
+    def call(self, op, request):
         if op == 'wopBuildPaths':
-            return (await self.impure_build_paths(request))
+            return self.impure_build_paths(request)
         else:
-            return (await self.client.call(op, request))
+            return self.client.call(op, request)
 
     def with_no_logs(self, retval):
         return no_logs(), lambda: retval
 
+    @store_generator_return_value
     async def impure_build_paths(self, request):
-        eprint("Impurely building paths!")
+        eprint("Impurely building", request)
         # TODO handle building multiple paths
         if len(request.paths) != 1 or request.mode != 0:
-            return (await self.client.call("wopBuildPaths", request))
+            # in an ideal world, this would be just "return (yield from call(stuff))"
+            stderr_with_response = self.client.call("wopBuildPaths", request)
+            for msg in stderr_with_response:
+                yield msg
+            agen_return(stderr_with_response.get())
         else:
-            path = Path(request.paths[0])
-            if path.exists():
-                # in an ideal world, this would look like...
-                # return {"ret": 1}
-                # but we have to stack rip...
-                # maybe we should have an interface that looks like..
-                # self, request, return_cb
-                # then we function as an async generator here
-                return empty_agen(), lambda: {"ret": 1}
+            path, output = request.paths[0].split('!', 1)
+            path = Path(path)
+            # if path.exists():
+            #     eprint("not building because it's already there")
+            #     agen_return({"ret": 1})
+            drv = parse_derivation(path.read_text())
+            # TODO handle building non-builtins
+            await self.impure_build(drv)
+            agen_return({"ret": 1})
 
     async def perform_call(self, op, request):
-        stderr, get_response = await self.client.call(op, request)
-        async for typ, msg in stderr:
+        stderr_with_response = self.client.call(op, request)
+        async for typ, msg in stderr_with_response:
             # currently, the client is already printing it
             pass
-        return get_response()
+        return stderr_with_response.get()
 
     async def add_nar_to_store(self, name, hashType, recursive, nar):
         return (await self.perform_call(
@@ -241,9 +251,12 @@ class ImpureClient:
     @classmethod
     async def make(cls, make=make_nix_client):
         connect_with, server_version = await make()
+        @store_generator_return_value
         async def my_connect_with(client_version, initial_options):
-            iter_stderr, get_client = await connect_with(client_version, initial_options)
-            return iter_stderr, lambda: cls(get_client())
+            stderr_with_client = connect_with(client_version, initial_options)
+            async for typ, msg in stderr_with_client:
+                yield typ, msg
+            agen_return(cls(stderr_with_client.get()))
         return my_connect_with, server_version
 
     async def impure_build(self, drv):
@@ -270,6 +283,7 @@ class ImpureClient:
         if drv.builder == 'builtin:fetchurl':
             return (await self.add_bytes_to_store(name, hashType, recursive, fetchurl(drv.env['url'])))
         else:
+            # TODO handle building non-builtins
             raise Exception("currently only works for builtin:fetchurl")
 
     async def build_paths(self, drvs):
@@ -361,7 +375,7 @@ def do_things(path):
 
 def fully_proxy():
     start(nix_server(
-        make_nix_client,
+        ImpureClient.make,
         tag_as("stdin", con_reader(fd_reader(sys.stdin))),
         tag_as("stdout", con_writer(fd_writer(sys.stdout)))
     ))
