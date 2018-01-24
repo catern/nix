@@ -180,22 +180,76 @@ def add_to_store(path, hashType, recursive):
     else:
         subprocess.check_call(['nix-store', '--add-fixed', hashType, path])
 
+def read_path_as_nar(path):
+    if path.is_dir():
+        return {
+            "type": b"directory",
+            "entries": [{"name": child.name.encode(), "node": read_path_as_nar(child)}
+                        for child in path.iterdir()],
+        }
+    elif path.is_symlink():
+        return {
+            "type": b"symlink",
+            "target": os.readlink(path),
+        }
+    elif path.is_file():
+        executable = bool(path.stat().st_mode & 0o111)
+        return {
+            "type": b"regular",
+            "flag": b"executable" if executable else b"",
+            "contents": bytes(path),
+        }
+    else:
+        raise Exception("this path is of a type that can't be read as a NAR")
+
+@store_generator_return_value
+async def impure_build_nonbuiltin(drv):
+    "Returns a NAR-dict containing the file/folder"
+    import tempfile
+    import subprocess
+    import shutil
+    fake_outdir = Path(tempfile.mkdtemp())
+    fake_out = fake_outdir/"out"
+    workdir = Path(tempfile.mkdtemp())
+
+    env = os.environ.copy()
+    env.update(drv.env)
+    env.update({'NIX_BUILD_TOP': workdir, 'out': fake_out, 'TMPDIR': workdir})
+    cmdline = [drv.builder] + drv.args
+    yield "STDERR_NEXT", {"data":f"Starting impure builder: {cmdline}"}
+    proc = subprocess.Popen(cmdline, cwd=workdir, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    if proc.wait() != 0:
+        raise StderrError("Impure builder exited", 1)
+    nar = read_path_as_nar(fake_out)
+    shutil.rmtree(workdir)
+    shutil.rmtree(fake_outdir)
+    agen_return(nar)
+
 class ImpureClient:
     def __init__(self, client):
         self.client = client
 
+    @classmethod
+    async def make(cls, make=make_nix_client):
+        connect_with, server_version = await make()
+        @store_generator_return_value
+        async def my_connect_with(client_version, initial_options):
+            stderr_with_client = connect_with(client_version, initial_options)
+            async for typ, msg in stderr_with_client:
+                yield typ, msg
+            agen_return(cls(stderr_with_client.get()))
+        return my_connect_with, server_version
+
+    # TODO I should really log exactly what I get from the client.
+    # Maybe I should have two PrintingClients, one before ImpureClient, one after.
     def call(self, op, request):
         if op == 'wopBuildPaths':
             return self.impure_build_paths(request)
         else:
             return self.client.call(op, request)
 
-    def with_no_logs(self, retval):
-        return no_logs(), lambda: retval
-
     @store_generator_return_value
     async def impure_build_paths(self, request):
-        eprint("Impurely building", request)
         # TODO handle building multiple paths
         if len(request.paths) != 1 or request.mode != 0:
             # in an ideal world, this would be just "return (yield from call(stuff))"
@@ -211,80 +265,64 @@ class ImpureClient:
             #     agen_return({"ret": 1})
             drv = parse_derivation(path.read_text())
             # TODO handle building non-builtins
-            await self.impure_build(drv)
-            agen_return({"ret": 1})
+            stderr_with_response = self.impure_build(drv)
+            async for msg in stderr_with_response:
+                yield msg
+            agen_return(stderr_with_response.get())
 
-    async def perform_call(self, op, request):
-        stderr_with_response = self.client.call(op, request)
-        async for typ, msg in stderr_with_response:
-            # currently, the client is already printing it
-            pass
-        return stderr_with_response.get()
-
-    async def add_nar_to_store(self, name, hashType, recursive, nar):
-        return (await self.perform_call(
+    def add_nar_to_store(self, name, hashType, recursive, nar):
+        return self.client.call(
             "wopAddToStore", {
                 "baseName": name,
                 "fixed": not (hashType == 'sha256' and recursive),
                 "recursive": recursive,
                 "hashType": hashType,
                 "nar": nar,
-        }))
+        })
 
-    async def add_bytes_to_store(self, name, hashType, recursive, bytes):
-        return (await self.add_nar_to_store(name, hashType, recursive, {
+    def add_bytes_to_store(self, name, hashType, recursive, bytes):
+        return self.add_nar_to_store(name, hashType, recursive, {
             "type": b"regular",
             "contents": bytes,
-        }))
-
-    @classmethod
-    async def make(cls):
-        client_hello, server_version = await make_nix_client()
-        client_init_stderr, get_client = await client_hello(0x114, {
-            # TODO we should be able to just omit this...
-            "cpu_affinity": 4,
         })
-        async for typ, msg in client_init_stderr:
-            eprint(typ, msg)
-        return cls(get_client())
-
-    @classmethod
-    async def make(cls, make=make_nix_client):
-        connect_with, server_version = await make()
-        @store_generator_return_value
-        async def my_connect_with(client_version, initial_options):
-            stderr_with_client = connect_with(client_version, initial_options)
-            async for typ, msg in stderr_with_client:
-                yield typ, msg
-            agen_return(cls(stderr_with_client.get()))
-        return my_connect_with, server_version
-
+        
+    @store_generator_return_value
     async def impure_build(self, drv):
         "Impurely build this derivation in the current environment and add it to the store."
         output = drv.outputs['out']
         if not output.hash:
-            raise Exception("only fixed output derivations can be build impurely")
+            raise StderrError("only fixed output derivations can be build impurely", 1)
         if not len(drv.outputs) == 1:
-            raise Exception("fixed output derivations must only have one output")
+            raise StderrError("fixed output derivations must only have one output", 1)
         if not all(input.exists() for input in drv.inputs):
-            raise Exception("all inputs must be valid before building")
+            raise StderrError("all inputs must be valid before building", 1)
     
+        yield "STDERR_NEXT", {"data":"starting impure build"}
         name = str(output.path).split('-', 1)[1]
         if ":" in output.hashAlgo:
             option, hashType = output.hashAlgo.split(':')
             if option == 'r':
                 recursive = True
             else:
-                raise Exception("unknown option", option)
+                raise StderrError(f"unknown option {option}", 1)
         else:
             hashType = output.hashAlgo
             recursive = False
     
         if drv.builder == 'builtin:fetchurl':
-            return (await self.add_bytes_to_store(name, hashType, recursive, fetchurl(drv.env['url'])))
+            nar = {
+                "type": b"regular",
+                "contents": fetchurl(drv.env['url']),
+            }
         else:
-            # TODO handle building non-builtins
-            raise Exception("currently only works for builtin:fetchurl")
+            # TODO finish this guy!!!
+            stderr_nar = impure_build_nonbuiltin(drv)
+            async for msg in stderr_nar:
+                yield msg
+            nar = stderr_nar.get()
+        async for msg in self.add_nar_to_store(name, hashType, recursive, nar):
+            yield msg
+        agen_return({"ret": 1})
 
     async def build_paths(self, drvs):
         # TODO set up a reactive build graph
@@ -293,85 +331,10 @@ class ImpureClient:
                 await self.impure_build(drv)
         return 1
 
-def impure_build_nonbuiltin(drv):
-    import tempfile
-    import subprocess
-    import shutil
-    fake_out = Path(tempfile.mkdtemp())
-    workdir = Path(tempfile.mkdtemp())
-
-    env = os.environ.copy()
-    env.update(drv.env)
-    env.update({'NIX_BUILD_TOP': workdir, 'out': fake_out, 'TMPDIR': workdir})
-    cmdline = [drv.builder] + drv.args
-    proc = subprocess.Popen(cmdline, cwd=workdir, env=env)
-    if proc.wait() != 0:
-        raise Exception
-    shutil.rmtree(workdir)
-    return fake_out
-
 def do_things(path):
-    # need to query derivation info.
-    # or maybe I just read it and build it?
-    # yeah that seems right
-
-    # no no
-    # hmm
-    # should I read first?
-    # or check first?
-
-    # I suppose I should wopQueryMissing first, and see which of them is missing.
-
-    # oh wait, in any case I need to read the drv to find out if it's a fixout.
-
-    # okay, so I'll read the drv,
-    with path.open() as f:
-        drv = parse_derivation(f.read())
-    eprint(drv)
-    # check for whether its output exists (by just checking the filesystem lmao)
-    if drv.outputs['out'].path.exists():
-        eprint("already exists")
-        print(drv.outputs['out'].path)
-        # return
-    # build it impurely,
-    eprint("building")
-    async def do_stuff():
-        client = await ImpureClient.make()
-        return (await client.impure_build(drv))
-
-    result = LinearVariable()
-    start(do_stuff(), result.set)
-    eprint("result", result.get())
+    import nar
+    eprint(nar.dump.parse(nar.dump.build(read_path_as_nar(path))))
     return
-
-    # later i'll handle recursing and building its inputs
-    async def things():
-        client_hello, server_version = await make_nix_client()
-        client_init_stderr, get_client = await client_hello(0x114, {
-            # TODO we should be able to just omit this...
-            "cpu_affinity": 4,
-        })
-        async for typ, msg in client_init_stderr:
-            eprint(typ, msg)
-        client = get_client()
-        async def perform_call(op, request):
-            stderr, get_response = await client.call(op, request)
-            async for typ, msg in stderr:
-                # currently, the client is already printing it
-                pass
-            return get_response()
-        response = await perform_call(
-            "wopAddToStore", {
-                "baseName": "neato",
-                "fixed": 0,
-                "recursive": 1,
-                "hashType": "sha256",
-                "nar": {
-                    "type": b"regular",
-                    "contents": b"amazing I did it",
-                },
-        })
-    start(things())
 
 def fully_proxy():
     start(nix_server(
