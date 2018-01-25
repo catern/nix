@@ -91,44 +91,45 @@ async def nix_server(impl_start, read_con, write_con):
 import reprlib
 import construct
 class PrintingConnectedClient:
-    def __init__(self, client):
+    def __init__(self, client, prefix):
         self.client = client
+        self.prefix = prefix
 
     @store_generator_return_value
     async def call(self, op, request):
         if isinstance(request, construct.lib.container.Container):
-            eprint(">", op, request)
+            eprint(f"{self.prefix}>", op, request)
         else:
-            eprint(">", op, reprlib.repr(request))
+            eprint(f"{self.prefix}>", op, reprlib.repr(request))
         stderr_with_response = self.client.call(op, request)
         try:
             async for typ, msg in stderr_with_response:
-                eprint("<", typ, msg)
+                eprint(f"{self.prefix}< {typ} {msg}")
                 yield typ, msg
         except StderrError as e:
-            eprint(f"< ERROR({e.status}): {e.error}")
+            eprint(f"{self.prefix}< ERROR({e.status}): {e.error}")
             raise
         response = stderr_with_response.get()
-        eprint("<", response)
+        eprint(f"{self.prefix}<", response)
         agen_return(response)
 
-async def printing_nix_client(read, write):
-    connect_with, server_version = await nix_client(read, write)
-    eprint(f"< server connection response, version:{server_version:#0x}")
+async def printing_nix_client(make, prefix=""):
+    connect_with, server_version = await make()
+    eprint(f"{prefix}< server connection response, version:{server_version:#0x}")
 
     @store_generator_return_value
     async def printing_connect_with(client_version, initial_options):
-        eprint(f"> client connection response, version:{client_version:#0x}", initial_options)
+        eprint(f"{prefix}> client connection response, version:{client_version:#0x}", initial_options)
         stderr_with_client = connect_with(client_version, initial_options)
         try:
             async for typ, msg in stderr_with_client:
-                eprint("<", typ, msg)
+                eprint(f"{prefix}< typ msg")
                 yield typ, msg
         except StderrError as e:
-            eprint(f"< LOGIN ERROR({e.status}): {e.error}")
+            eprint(f"{prefix}< LOGIN ERROR({e.status}): {e.error}")
             raise
-        eprint("== Connection initialized.")
-        agen_return(PrintingConnectedClient(stderr_with_client.get()))
+        eprint(f"{prefix}== Connection initialized.")
+        agen_return(PrintingConnectedClient(stderr_with_client.get(), prefix))
     return printing_connect_with, server_version
 
 def tag_as(s, f):
@@ -138,15 +139,13 @@ def tag_as(s, f):
     # return wrapped
     return f
 
-async def make_nix_client():
+async def default_nix_client():
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server_address = "/nix/var/nix/daemon-socket/socket"
     sock.connect(server_address)
     sock_in = tag_as("sock in", con_reader(fd_reader(sock)))
     sock_out = tag_as("sock out", con_writer(fd_writer(sock)))
-    return (await printing_nix_client(sock_in, sock_out))
-    # return (await nix_client(sock_in, sock_out))
-
+    return (await nix_client(sock_in, sock_out))
 
 from collections import namedtuple
 from pathlib import Path
@@ -197,7 +196,7 @@ def read_path_as_nar(path):
         return {
             "type": b"regular",
             "flag": b"executable" if executable else b"",
-            "contents": bytes(path),
+            "contents": path.read_bytes(),
         }
     else:
         raise Exception("this path is of a type that can't be read as a NAR")
@@ -225,13 +224,24 @@ async def impure_build_nonbuiltin(drv):
     shutil.rmtree(fake_outdir)
     agen_return(nar)
 
+from nar import dump as nardump
+import hashlib
+import binascii
+def make_hash(byt, typ):
+    if typ == 'sha256':
+        m = hashlib.sha256()
+        m.update(byt)
+        return binascii.hexlify(bytearray(m.digest()))
+    else:
+        raise StderrError(f"unsupported hash type {typ}", 1)
+
 class ImpureClient:
     def __init__(self, client):
         self.client = client
 
     @classmethod
-    async def make(cls, make=make_nix_client):
-        connect_with, server_version = await make()
+    async def make(cls, wrapped_make):
+        connect_with, server_version = await wrapped_make()
         @store_generator_return_value
         async def my_connect_with(client_version, initial_options):
             stderr_with_client = connect_with(client_version, initial_options)
@@ -240,8 +250,6 @@ class ImpureClient:
             agen_return(cls(stderr_with_client.get()))
         return my_connect_with, server_version
 
-    # TODO I should really log exactly what I get from the client.
-    # Maybe I should have two PrintingClients, one before ImpureClient, one after.
     def call(self, op, request):
         if op == 'wopBuildPaths':
             return self.impure_build_paths(request)
@@ -264,7 +272,6 @@ class ImpureClient:
             #     eprint("not building because it's already there")
             #     agen_return({"ret": 1})
             drv = parse_derivation(path.read_text())
-            # TODO handle building non-builtins
             stderr_with_response = self.impure_build(drv)
             async for msg in stderr_with_response:
                 yield msg
@@ -320,8 +327,23 @@ class ImpureClient:
             async for msg in stderr_nar:
                 yield msg
             nar = stderr_nar.get()
-        async for msg in self.add_nar_to_store(name, hashType, recursive, nar):
+
+        # TODO we should hash the NAR as we stream it into the store.
+        # That saves builds when we don't know the correct hash up front.
+        # TODO figure out a proper way to actually return the hash when it's wrong in the derivation...
+        # maybe we can't. maybe it's impossible.
+        # or wait, can't we just query the hash once we add it to the store?
+        output_hash = make_hash(nardump.build(nar), hashType).decode()
+        if output_hash != output.hash:
+            raise StderrError(f"calculated hash {output_hash} different from hash in derivation {output.hash}", 1)
+        stderr_path = self.add_nar_to_store(name, hashType, recursive, nar)
+        async for msg in stderr_path:
             yield msg
+
+        # sanity check, this should be the same if the hash is the same
+        final_path = stderr_path.get().path
+        if final_path != str(output.path):
+            raise StderrError(f"built path {final_path} different from path calculated from hash {output.path}", 1)
         agen_return({"ret": 1})
 
     async def build_paths(self, drvs):
@@ -331,29 +353,62 @@ class ImpureClient:
                 await self.impure_build(drv)
         return 1
 
+# OK, time to work on the reactive build system.
+# so I can build multiple things.
+
+# what's it looks like?
+
+# well, let's think of it not as, building multiple things, but rather as, building the inputs to one thing.
+
+# specifically we want specific paths. hmm.
+async def build(self, drv, outputs, stderr_callback):
+    if self.ensure_path(drv, stderr_callback):
+        return
+    # hmm what is this really
+    # I think this is the real mystery.
+    # I should implement this cleanly so I can get a real nice reactive system!
+    await await_all(build(input_drv, outputs, stderr_callback) for input_drv, outputs in drv.inputs.items())
+    # okay but now here I want to build myself
+    # but y'know I want to submit jobs to the main system if they contain nothing but fixed outputs...
+    # no forget about that, let's just build ourselves.
+
+
+    # hey wait a second, isn't this a "pull" rather than an event-driven "push"?
+
+    # okay doing it async is a nightmare.
+
+    # let's just do it inefficiently, synchronously.
+    # we can rewrite in a more optimal form later.
+    if drv.fixed_output():
+        return (await self.impure_build(drv, stderr_callback))
+    else:
+        return (await self.submit_build(drv, outputs, stderr_callback))
+
 def do_things(path):
     import nar
-    eprint(nar.dump.parse(nar.dump.build(read_path_as_nar(path))))
+    nar_dict = read_path_as_nar(path)
+    eprint(nar_dict)
+    nar_bytes = nar.dump.build(nar_dict)
+    eprint(nar_bytes)
+    m = hashlib.sha256()
+    m.update(nar_bytes)
+    digest = m.digest()
+    eprint(base64.b32encode(digest))
+    import binascii
+    eprint(binascii.hexlify(bytearray(digest)))
     return
 
 def fully_proxy():
     start(nix_server(
-        ImpureClient.make,
+        lambda: printing_nix_client(lambda: ImpureClient.make(lambda: printing_nix_client(default_nix_client, "inner ")), "outer "),
         tag_as("stdin", con_reader(fd_reader(sys.stdin))),
         tag_as("stdout", con_writer(fd_writer(sys.stdout)))
     ))
     eprint("DONE\n")
 
 # TODO
-# reimplement script using this "library"
 # proper on-stack event loop
 # proxying with actual functionality
-# extract deps into another file
-
-# check if there's a way to get a "Not enough bytes" exception from
-# construct; otherwise with my current model, I'll just block forever
-# when I mis-parse something, since I interpret all exceptions as "Not
-# enough bytes"
 def just_dissect():
     server_address = "/nix/var/nix/daemon-socket/socket"
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -365,7 +420,7 @@ def just_dissect():
     async def make_nix_client():
         sock_in = tag_as("sock in", con_reader(sock_channel.recv))
         sock_out = tag_as("sock out", con_writer(dummy_write))
-        return (await printing_nix_client(sock_in, sock_out))
+        return (await printing_nix_client(lambda: nix_client(sock_in, sock_out)))
         # return (await nix_client(sock_in, sock_out))
 
     start(nix_server(
